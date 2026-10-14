@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -764,7 +764,7 @@ requires-dist = [
     { name = "osmium", specifier = ">=4.3.1" },
     { name = "osmnx", specifier = ">=1.4.0" },
     { name = "palettable", specifier = ">=3.3.3" },
-    { name = "pandana", specifier = ">=0.7" },
+    { name = "pandana", specifier = ">=0.8" },
     { name = "pandas", specifier = ">=3.0.2" },
     { name = "polars", specifier = ">=1.39.3" },
     { name = "py7zr", specifier = ">=1.1.3" },
@@ -2231,7 +2231,7 @@ wheels = [
 
 [[package]]
 name = "pandana"
-version = "0.7"
+version = "0.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
@@ -2240,7 +2240,19 @@ dependencies = [
     { name = "scikit-learn" },
     { name = "tables" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/6d/8a/5b2fad57442322a48900d6bf63f0034998d99cc55facedf7a5b5e0f97063/pandana-0.7.tar.gz", hash = "sha256:416a5998ba9ae64fe546186f430e705b8a59bb5ff71c195fd64d734f9c70e795", size = 295028, upload-time = "2023-07-26T15:41:34.687Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/75/85/7a65692676ef5f27349f399711710aefd13754d9ab00984199cf0fac902b/pandana-0.8.tar.gz", hash = "sha256:1a179b0e4cffa8287a0724f67c2f666891bdeb203288bd68181ca86189e3014d", size = 216875, upload-time = "2026-08-24T20:26:52.324Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4f/02/7aed0949bc4847648f06a510c8151597e5af6f513ae99a28c39811c50947/pandana-0.8-cp313-cp313-macosx_14_0_x86_64.whl", hash = "sha256:440e7c14ff87bd7ab83d545fb669718a6f312e23ede67789a641eac0763bb3e0", size = 456352, upload-time = "2026-08-24T20:26:39.1Z" },
+    { url = "https://files.pythonhosted.org/packages/01/17/6bf977fc52f187bdca11e97db24423914ca7a5e8062dc23b821347e1abe7/pandana-0.8-cp313-cp313-macosx_15_0_arm64.whl", hash = "sha256:94e8c4847265b67ccb71c5027b82d5e4f5f0b85787b65d15d80ef2e5fd11b112", size = 411606, upload-time = "2026-08-24T20:26:40.507Z" },
+    { url = "https://files.pythonhosted.org/packages/7b/f8/61a9a6271603d13a355e197081bffa771aeb75393747fb2569a940fe3122/pandana-0.8-cp313-cp313-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:8db7c233a7f4223bfd719f1ab48dc3e4f412065c2d28620c6095bae8061e40d1", size = 2172308, upload-time = "2026-08-24T20:26:41.739Z" },
+    { url = "https://files.pythonhosted.org/packages/52/7a/fdd5514b49a792994f068a421092954575888e2eb56a222fcbb4b234b09e/pandana-0.8-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:4526a0fb9c2f228bab16a9e88fe450e92356fbb87251a7c5a9101edf3a579eac", size = 2212294, upload-time = "2026-08-24T20:26:43.174Z" },
+    { url = "https://files.pythonhosted.org/packages/da/80/8c9b25deba2034fc210cb71142724eda0abdf5a325af0b56270733abc5fb/pandana-0.8-cp313-cp313-win_amd64.whl", hash = "sha256:00fb9ce24e55c38a8ba6b0ac4baf6838ee917f5c1faa57ce83fb75c7a0e68567", size = 447376, upload-time = "2026-08-24T20:26:44.69Z" },
+    { url = "https://files.pythonhosted.org/packages/5a/c1/9f26cfd9881d9867dda9038b77bd5f4abb6d19f35acd4b7fba96f6bd7013/pandana-0.8-cp314-cp314-macosx_14_0_x86_64.whl", hash = "sha256:53a47799feb4468eb6bcda1b03043c2c24b7b38bc1043ae7c86fa24783abc16b", size = 456962, upload-time = "2026-08-24T20:26:45.753Z" },
+    { url = "https://files.pythonhosted.org/packages/48/91/b5976d5d14930e95926df6e89a8615ae549a5237f39f9c2714cc7f3fd0a9/pandana-0.8-cp314-cp314-macosx_15_0_arm64.whl", hash = "sha256:ff2cd166d7530a67b6c3878614277062001df91244eb03b852b8cc0db47bf970", size = 411959, upload-time = "2026-08-24T20:26:46.894Z" },
+    { url = "https://files.pythonhosted.org/packages/25/6c/1d4ee853c6c5b3b590a15ed90760a9cf6da2c9ff5c27acc4ba9f7331d02c/pandana-0.8-cp314-cp314-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:e03b9eba441810f2ea0a7186813724f993959f106237092b478d507e4fffe1f1", size = 2171433, upload-time = "2026-08-24T20:26:48.219Z" },
+    { url = "https://files.pythonhosted.org/packages/19/40/66367cf3cb61738d3239420b12e740f765a779937f32d268ee3814cb91e6/pandana-0.8-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b1c4a6fa14560c1f1ea8193ee52e0b43702630d1af7b28fee6e818bd189a4362", size = 2208998, upload-time = "2026-08-24T20:26:49.854Z" },
+    { url = "https://files.pythonhosted.org/packages/8a/6f/b0a9f9ff23867b532aeab7d965251a993645e47ca5219053567690914df2/pandana-0.8-cp314-cp314-win_amd64.whl", hash = "sha256:a45be0ebf823359bbd9b2691801e3edb8b887f9ccb42c38817aa02f91d558965", size = 459619, upload-time = "2026-08-24T20:26:51.172Z" },
+]
 
 [[package]]
 name = "pandas"
