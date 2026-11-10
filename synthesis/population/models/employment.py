@@ -5,6 +5,9 @@ import gc
 from catboost import CatBoostClassifier, Pool
 from sklearn.model_selection import train_test_split  # <-- ADD
 import logging
+from pathlib import Path
+
+from data.structural_survey.apprenticeship import model_apprentice_diagnostics
 
 logger = logging.getLogger("synpp")
 # ---------------------------------------------------------
@@ -18,11 +21,19 @@ def draw_multinomial_from_proba(proba_matrix, classes, seed=None):
     return classes[chosen_idx]
 
 def configure(context):
+    context.config("random_seed")
     context.stage("data.constants")
     context.stage("data.structural_survey.structural_survey")
     context.stage("data.statpop.statpop")
 
 def execute(context):
+    from synthesis.population.models.non_private import execute_without_home_only
+    c = context.stage("data.constants")
+    return execute_without_home_only(context, "data.statpop.statpop", _execute_model,
+                                     {"employed": c.INACTIVE, "job_position": 70})
+
+
+def _execute_model(context):
     c = context.stage("data.constants")
 
     # -------------------------------------------------------------------
@@ -32,8 +43,8 @@ def execute(context):
     JOB_MODEL      = "gbm"        # "gbm" or "rf"
 
     CHUNK_SIZE = 25_000
-    SEED_ACTIVITY = 123
-    SEED_JOB      = 456
+    SEED_ACTIVITY = int(context.config("random_seed"))
+    SEED_JOB = SEED_ACTIVITY + 1
 
     CANTON_FOR_ANALYSIS = 22  # e.g. "1"
 
@@ -45,7 +56,7 @@ def execute(context):
     # 0. LOAD
     # -------------------------------------------------------------------
     survey_df = context.stage("data.structural_survey.structural_survey")
-    pop_df = context.stage("data.statpop.statpop")
+    pop_df = context.stage("data.statpop.statpop").copy()
 
     survey_df['employed']     = survey_df['employed'].astype('int32')
     survey_df['job_position'] = survey_df['job_position'].astype('int32')
@@ -103,14 +114,14 @@ def execute(context):
                 max_depth=3,
                 learning_rate=0.1,
                 max_iter=100,
-                random_state=42
+                random_state=SEED_ACTIVITY
             )
         elif model_type == "rf":
             return RandomForestClassifier(
                 n_estimators=300,
                 max_depth=15,
                 min_samples_leaf=5,
-                random_state=42,
+                random_state=SEED_ACTIVITY,
                 n_jobs=1
             )
         elif model_type in ("catboost", "cat"):
@@ -120,7 +131,7 @@ def execute(context):
                 learning_rate=0.01,
                 depth=10,
                 l2_leaf_reg=6.0,
-                random_seed=42,
+                random_seed=SEED_ACTIVITY,
                 verbose=200,
                 bootstrap_type="Bernoulli",
                 subsample=0.8
@@ -141,7 +152,7 @@ def execute(context):
             train_idx, val_idx = train_test_split(
                 idx,
                 test_size=VALID_FRAC,
-                random_state=42,
+                random_state=SEED_ACTIVITY,
                 stratify=y
             )
 
@@ -217,7 +228,9 @@ def execute(context):
         youth_mask = (age_arr >= 15) & (age_arr <= 23)
         adult_mask = (age_arr >= 24)
 
-        act_draw = np.empty(end - start, dtype=int)
+        # All modelled residents use the same age-specific predictions, including
+        # recovered singletons near dorm candidates. Under-15s stay inactive.
+        act_draw = np.full(end - start, c.INACTIVE, dtype=int)
 
         # youth predictions
         if youth_mask.any():
@@ -272,6 +285,13 @@ def execute(context):
 
     logger.info("Final employed distribution:")
     logger.info(pop_df[pop_df['age'] > 14]['employed'].value_counts(normalize=True))
+
+    # Inspect the national apprentice stock before the later student draw. Keep
+    # each SS year separate and label synthetic counts as sample persons.
+    apprentice_diagnostics = model_apprentice_diagnostics(survey_df, pop_df, include_students=False)
+    apprentice_diagnostics.to_csv(Path(context.path()) / "national_apprentice_stock.csv", index=False)
+    logger.info("National apprenticeship before student assignment:\n%s",
+                apprentice_diagnostics.to_string(index=False))
 
     # -------------------------------------------------------------------
     # 6. DIAGNOSTICS

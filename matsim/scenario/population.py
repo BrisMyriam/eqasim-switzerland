@@ -3,15 +3,17 @@ import io
 import shutil
 import subprocess
 import pandas as pd
+import polars as pl
 import geopandas as gpd
 from shapely import wkt
+from xml.sax.saxutils import escape
 
 import matsim.writers
 from matsim.writers import backlog_iterator
 import logging
 from data.external_population.constants import ExternalPopulationConstants
 from data.utils import coerce_boolean_series
-from synthesis.population.departure_times.trips_departures import get_best_departue_time
+from synthesis.population.trips_with_departures import align_activities
 
 logger = logging.getLogger("synpp")
 
@@ -20,13 +22,18 @@ logger = logging.getLogger("synpp")
 HOME_DESTINATION_ID = -1
 
 def configure(context):
-    context.stage("synthesis.population.models.subscriptions")
-    context.stage("synthesis.population.trips")
+    # The zones of the regional subscriptions of the Swiss synthetic population; false: without them
+    context.config("use_subscription_zones", default = True)
+    context.stage("synthesis.population.models.subscription_zones" if context.config("use_subscription_zones")
+                  else "synthesis.population.models.subscriptions", alias = "synthetic_persons")
+    context.config("enable_mode_choice", False)
+    context.stage("mode_choice.run" if context.config("enable_mode_choice") else "synthesis.population.trips_with_departures",
+                  alias="population_trips")
     context.stage("synthesis.population.activities")
     context.stage("synthesis.population.spatial.locations")
     context.stage("data.spatial.cantons")
-    context.config("use_freight", default = False)
-    context.config("use_lcv", default = False)
+    context.config("use_freight", default = True)
+    context.config("use_lcv", default = True)
     context.stage("synthesis.freight.trips")
     context.stage("synthesis.lcv.trips")
     context.stage("data.constants")
@@ -40,23 +47,23 @@ def configure(context):
     if context.config("include_cross_border"):
         context.stage("data.cross_border.generate_cross_border_traffic")
 
-    context.config("include_external_population", default = False)
+    context.config("include_external_population", default = True)
     if context.config("include_external_population"):
         context.stage("data.external_population.read_outputs")
         context.stage("data.external_population.constants")
         context.stage("synthesis.population.destinations")
 
-    context.config("correct_departure_time", default=True)
-    if context.config("correct_departure_time"):
-        context.stage("synthesis.population.departure_times.trips_departures")
-
 
 
 def execute(context):
+    population_trips = context.stage("population_trips")
+    if isinstance(population_trips, pl.DataFrame):
+        population_trips = population_trips.to_pandas()
+
     cache_path    = context.path()
     cst           = context.stage("data.constants")
-    df_persons    = context.stage("synthesis.population.models.subscriptions").copy()
-    df_activities = context.stage("synthesis.population.activities")
+    df_persons    = context.stage("synthetic_persons").copy()
+    df_activities = align_activities(context.stage("synthesis.population.activities"), population_trips)
     df_vehicles   = context.stage("synthesis.vehicles.vehicles")[1]  
 
     # Correct employement if required
@@ -64,18 +71,9 @@ def execute(context):
         df_persons["employed"] = (pd.to_numeric(df_persons["employed"], errors="coerce").fillna(0) == cst.EMPLOYED).astype(int)
 
     # Attach following modes to activities
-    df_trips         = pd.DataFrame(context.stage("synthesis.population.trips"), copy=True)[["person_id", "trip_index", "mode"]]
+    df_trips         = pd.DataFrame(population_trips, copy=True)[["person_id", "trip_index", "mode"]]
     df_trips.columns = ["person_id", "activity_index", "following_mode"]
     df_activities    = pd.merge(df_activities, df_trips, on=["person_id", "activity_index"], how="left")
-
-    # correct departure times
-    if context.config("correct_departure_time"):
-        df = df_activities[["person_id","activity_index", "end_time"]]
-        df.columns = ['person_id', 'trip_index', 'end_time']
-        df['new_end_time'] = get_best_departue_time(context, df)
-        df['new_end_time'] = df['new_end_time'].fillna(df['end_time'])
-        df_activities['end_time'] = df['new_end_time']
-        del df
 
     # Attach locations to activities
     df_locations  = context.stage("synthesis.population.spatial.locations")
@@ -202,8 +200,18 @@ def execute(context):
         df_vehicles   = df_vehicles.sort_values(by = ["owner_id"])
     
     df_persons["is_car_passenger"] = df_persons["is_car_passenger"].fillna(False)
+
+    # Only the Swiss synthetic persons have subscription zones: the external and cross-border agents get none
+    df_persons["subscription_zones"] = df_persons.get("subscription_zones", pd.Series("", index = df_persons.index)).fillna("")
     
-    df_persons    = df_persons[PERSON_FIELDS]
+    # Extra scenario markers stay available to PersonWriter; imported external
+    # populations have no such classification and receive explicit False defaults.
+    residence_flags = ["non_private_dorm_candidate_households", "non_private_home_only_households", "is_synthetic_household"]
+    for column in residence_flags:
+        df_persons[column] = coerce_boolean_series(df_persons.get(column, pd.Series(False, index=df_persons.index)), name=column)
+    df_persons["non_private_model_status"] = df_persons.get(
+        "non_private_model_status", pd.Series("ordinary_models", index=df_persons.index)).fillna("ordinary_models")
+    df_persons    = df_persons[PERSON_FIELDS + ["subscription_zones"] + residence_flags + ["non_private_model_status"]]
     df_activities = df_activities[ACTIVITY_FIELDS]
     df_vehicles   = df_vehicles[VEHICLE_FIELDS]
     df_vehicles["owner_id"] = df_vehicles["owner_id"].astype(int)
@@ -416,6 +424,8 @@ ACTIVITY_ATTRIBUTES_TO_SAVE = dict(municipalityType  = "municipality_type",
 PERSON_FIELDS = ["person_id", "age", "car_availability", "employed", "driving_license", "sex", "home_x", "home_y", "pt_subscription", "household_id", "is_car_passenger", 
                  "has_walk_loop_trip", "has_car_loop_trip", "has_car_passenger_loop_trip", "has_pt_loop_trip", "has_bike_loop_trip", "income_class", "person_type", 
                  "cross_border_od", "bike_availability"]
+# The subscriptions attribute by pt_subscription
+SUBSCRIPTIONS = ["none", "GA", "VA", "HT", "VA+HT"]
 ACTIVITY_FIELDS = ["person_id", "activity_index", "start_time", "end_time", "duration", "purpose", "is_last","geometry", "destination_id", "following_mode", 
                    "municipality_type","municipality_id", "employee_density", "companies_density", "population_density", "ovgk"]
 PERSONS_DTYPES = {"person_id": int, "age": int, "car_availability": int, "bike_availability": int, "employed": bool, "driving_license": bool,
@@ -429,6 +439,14 @@ def _require_cols(df, cols, df_name):
     missing = [c for c in cols if c not in df.columns]
     if missing:
         raise KeyError(f"{df_name} is missing required columns: {missing}")
+
+
+def format_regional_products(zones):
+    """The RegionalSubscriptionProducts attribute: the zones of the regional subscription per fare network, the networks
+    joined by "+", e.g. ZVV:110,121+Unireso:10; empty without zones. zones: subscription_zones of
+    synthesis.population.models.subscription_zones ("ZVV:110,121", several networks separated by ";")."""
+    networks = [part.split(":", 1) for part in str(zones or "").split(";") if ":" in part]
+    return "+".join(f"{network.strip()}:{','.join(z.strip() for z in codes.split(','))}" for network, codes in networks)
 
 
 def _na_to(x, to=None):
@@ -527,9 +545,18 @@ class PersonWriter:
         writer.add_attribute("home_coordinate_y", "java.lang.Double", str(p.home_y))
         writer.add_attribute("carAvail", "java.lang.String", ["never", "always"][int(p.car_availability)])
 
-        writer.add_attribute("subscriptions", "java.lang.String", ["none", "GA", "VA", "HT", "VA+HT"][int(p.pt_subscription)])
+        writer.add_attribute("subscriptions", "java.lang.String", SUBSCRIPTIONS[int(p.pt_subscription)])
+        # the zones of the regional subscription, per fare network (see format_regional_products)
+        regional_products = format_regional_products(p.subscription_zones)
+        if regional_products:
+            writer.add_attribute("RegionalSubscriptionProducts", "java.lang.String", escape(regional_products))
 
         writer.add_attribute("isCarPassenger", "java.lang.Boolean", writer.true_false(getattr(p, "is_car_passenger", False)))
+        # Keep assumptions discoverable in the final population XML, not only
+        # intermediate CSVs. These flags do not alter simulation subpopulation.
+        for field in ["non_private_dorm_candidate_households", "non_private_home_only_households", "is_synthetic_household"]:
+            writer.add_attribute(field, "java.lang.Boolean", writer.true_false(getattr(p, field, False)))
+        writer.add_attribute("non_private_model_status", "java.lang.String", getattr(p, "non_private_model_status", "ordinary_models"))
 
         # loop trip flags may or may not exist -> default False
         writer.add_attribute("hasWalkLoopTrip", "java.lang.Boolean", writer.true_false(getattr(p, "has_walk_loop_trip", False)))

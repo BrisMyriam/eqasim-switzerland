@@ -2,11 +2,12 @@ import numpy as np
 import pandas as pd
 from data.spatial.cantons import impute_sp_region
 from data.spatial.municipality_types import impute as impute_municipality_types
-import data.spatial.ovgk
+from data.spatial.ovgk import impute as impute_ovgk
 import data.spatial.utils
 import data.spatial.zones
 import data.statpop.density
 import data.statpop.head_of_household
+import data.statpop.households
 import data.utils
 
 import logging
@@ -25,8 +26,14 @@ def configure(context):
     context.stage("data.spatial.districts")
     context.stage("data.spatial.ovgk")
     context.stage("data.constants")
-    context.config("threads")
-    context.config("only_permanent_residents", default=True)
+    context.config("threads", volatile=True)
+    context.config("only_permanent_residents", default=False)
+    context.config("retain_geocoded_missing_households", default=True)
+    context.config("non_private_residences_enabled", True)
+    context.config("non_private_residence_radius", 250.)
+    context.config("non_private_home_only_minimum_age", 39)
+    if context.config("non_private_residences_enabled"):
+        context.stage("data.gwr.residences")
 
 
 def execute(context):
@@ -35,6 +42,7 @@ def execute(context):
     df_link       = context.stage("data.statpop.link")
     c             = context.stage("data.constants")
     only_permanent = str(context.config("only_permanent_residents")).strip().lower() in ("1","true","yes","y","on")
+    retain_missing = str(context.config("retain_geocoded_missing_households")).strip().lower() in ("1", "true", "yes", "y", "on")
     # Filter non-main residence
     initial_count = len(df_persons)
     if (only_permanent):
@@ -58,12 +66,16 @@ def execute(context):
         on=("person_id", "municipality_id"),
         validate="one_to_one",
     )
-    df = pd.merge(
-        df,
-        df_households,
-        on="household_id",
-        validate="many_to_one",
-    ) # This removes the great majority of collective housing residents, there are only ~700 left at this point.
+    initial_count = len(df)
+    df = data.statpop.households.attach_persons(df, df_households, retain_missing)
+    if context.config("non_private_residences_enabled"):
+        df = data.statpop.households.classify_non_private_residences(
+            df, context.stage("data.gwr.residences"), context.config("non_private_residence_radius"),
+            context.config("non_private_home_only_minimum_age"))
+        logger.info("Recovered residence candidates: %d; older home-only residents: %d",
+                    df.non_private_dorm_candidate_households.sum(), df.non_private_home_only_households.sum())
+    logger.info("Recovered %d geocoded persons in synthetic one-person households; excluded %d without usable household/location.",
+                df["is_synthetic_household"].sum(), initial_count - len(df))
 
     # Impute the houeshold size for each STATPOP person
     df_size = df.groupby("household_id").size().reset_index(name="household_size")
@@ -85,6 +97,11 @@ def execute(context):
         on="household_id",
         validate="many_to_one",
     )
+    # A recovered singleton is a modelling household, not evidence of independent
+    # living. Keep the existing age constraint until younger representatives and
+    # their downstream household-model treatment have been explicitly agreed.
+    logger.info("%d recovered singleton persons excluded by the minimum household age rule.",
+                (df["is_synthetic_household"] & df["all_under_age"]).sum())
     df = df[~df["all_under_age"]]
 
     # This mapping comes Strukturerhebung (as it is the same as in STATPOP) Codelist
@@ -176,7 +193,7 @@ def execute(context):
 
     # Impute OV Guteklasse
     df_ovgk = context.stage("data.spatial.ovgk")
-    df_spatial = data.spatial.ovgk.impute(context, df_ovgk, df_spatial, ["person_id"], chunk_size=1e3, point_type="home")
+    df_spatial = impute_ovgk(context, df_ovgk, df_spatial, ["person_id"], chunk_size=1e3, point_type="home")
     df = pd.merge(
         df,
         df_spatial[["person_id", "ovgk"]],
@@ -216,6 +233,7 @@ def execute(context):
     )
 
     # Wrap everything up
+    residence_columns = [name for name in df if name.startswith("non_private_")]
     df = df[[
         "person_id", "household_id",
         "sex", "age",
@@ -224,7 +242,8 @@ def execute(context):
         "household_size", "statpop_household_id","statpop_person_id",
         "age_class", "household_size_class", "home_zone_id", "municipality_type",
         "home_municipality_id", "home_quarter_id", "canton_id", "district_id", "population_density", "sp_region", "ovgk",
-        "collective_housing_resident", "hh_oldest_age"] + children_columns]
+        "collective_housing_resident", "hh_oldest_age", "is_synthetic_household",
+        "statpop_source_household_id", "statpop_geocoding_indicator"] + children_columns + residence_columns]
 
     df = data.statpop.head_of_household.impute(df, c)
 

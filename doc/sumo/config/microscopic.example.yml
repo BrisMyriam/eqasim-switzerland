@@ -1,0 +1,17 @@
+# Replace these input filenames with an existing city network and sorted demand.
+working_directory: cache_sumo_city
+run:
+  - sumo.config.microscopic
+config:
+  random_seed: 518745
+  sumo_network_file: data/zurich.net.xml.gz
+  sumo_route_files:
+    - data/zurich.rou.xml.gz
+  sumo_additional_files: []
+  sumo_begin: 0
+  sumo_end: null # Cover all departures and let simulations finish.
+  sumo_micro_step_length: 0.5
+  sumo_micro_action_step_length: 1.0
+  sumo_rerouting_probability: 1.0  # GPS routing enabled by default.
+  sumo_rerouting_period: 60
+  sumo_time_to_teleport: 600

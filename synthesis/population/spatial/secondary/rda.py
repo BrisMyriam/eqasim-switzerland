@@ -150,23 +150,24 @@ class AngularTailSolver(RelaxationSolver):
 # ---------------------------
 # Optimized GravityChainSolver using Numba for the simulation loop
 # ---------------------------
-@njit
+@njit(cache=True)
 def _gravity_simulation_loop(locations, distances, alpha, eps, maximum_iterations, origin_weights, destination_weights):
     # locations: shape (N,2), distances: shape (L,) where L = N-1.
     N = locations.shape[0]
     L = distances.shape[0]
     valid = False
+    # Reuse scratch space instead of allocating four arrays every iteration.
+    diff = np.empty((L, 2))
+    lengths = np.empty(L)
+    offset = np.empty(L)
+    unit_dirs = np.empty((L, 2))
     for k in range(maximum_iterations):
         # Compute differences and lengths for each consecutive pair.
-        diff = np.empty((L, 2))
-        lengths = np.empty(L)
         for i in range(L):
             diff[i, 0] = locations[i, 0] - locations[i+1, 0]
             diff[i, 1] = locations[i, 1] - locations[i+1, 1]
             lengths[i] = np.sqrt(diff[i, 0] * diff[i, 0] + diff[i, 1] * diff[i, 1])
         # Compute offsets and unit directions.
-        offset = np.empty(L)
-        unit_dirs = np.empty((L, 2))
         for i in range(L):
             offset[i] = distances[i] - lengths[i]
             safe_length = lengths[i] if lengths[i] >= 1.0 else 1.0
@@ -367,9 +368,10 @@ class FeasibleDistanceSampler(DistanceSampler):
 
 
 class DiscretizationErrorObjective(AssignmentObjective):
-    def __init__(self, thresholds, detour_factor = None):
+    def __init__(self, thresholds, random, detour_factor=None):
         self.thresholds = thresholds
         self.detour_factor = detour_factor
+        self.random = random
         self.use_detour_factor = detour_factor is not None
         self.detour_objective_weight = float(self.thresholds.get("detour_objective_weight", 1.0))
         self.detour_objective_epsilon = float(self.thresholds.get("detour_objective_epsilon", 200.0))
@@ -461,7 +463,7 @@ class DiscretizationErrorObjective(AssignmentObjective):
         if same_anchor or (problem.get("origin") is None) or (problem.get("destination") is None):
             p_invalid = 1.0 - np.prod(1.0 - probs[high_idx])
             objective_penalty = self.detour_objective_weight * float(np.max(per_leg_penalty[high_idx]))
-            return np.random.random_sample() >= p_invalid, objective_penalty
+            return self.random.random_sample() >= p_invalid, objective_penalty
 
         # Rule 2: for different anchors, allow one high-detour leg, penalize only additional ones.
         if len(high_idx) <= 1:
@@ -472,7 +474,7 @@ class DiscretizationErrorObjective(AssignmentObjective):
         extra_probs = probs[extra_idx]
         p_invalid = 1.0 - np.prod(1.0 - extra_probs)
         objective_penalty = self.detour_objective_weight * float(np.max(per_leg_penalty[extra_idx]))
-        return np.random.random_sample() >= p_invalid, objective_penalty
+        return self.random.random_sample() >= p_invalid, objective_penalty
 
     def probability_to_unvalid_based_on_detour_factor(self, detour_factor):
         threshold = self.thresholds["detour_factor"]

@@ -4,7 +4,7 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from catboost import CatBoostClassifier
 import logging
 
-from data.utils import coerce_boolean_series
+from data.utils import binary_code_series, coerce_boolean_series
 
 logger = logging.getLogger("synpp")
 
@@ -139,6 +139,7 @@ def commute_from_location_df(pop_loc_df, pop_df, how="min"):
 
 
 def configure(context):
+    context.config("random_seed")
     context.stage("data.microcensus.persons")
     context.stage("data.microcensus.household_persons")
     context.stage("synthesis.population.spatial.primary.locations")
@@ -147,18 +148,27 @@ def configure(context):
 
 
 def execute(context):
+    from synthesis.population.models.non_private import execute_without_home_only
+    result = execute_without_home_only(context, "synthesis.population.enriched", _execute_model,
+                                     {"pt_subscription": 0})
+    result["car_availability"] = binary_code_series(result["car_availability"])
+    return result
+
+
+def _execute_model(context):
+    random_seed = int(context.config("random_seed"))
     # -------------------------------------------------------------------
     # CONFIG
     # -------------------------------------------------------------------
     PT_MODEL = "catboost"      # "rf" or "gbm" or "catboost"
-    SEED_PT  = 2026
+    SEED_PT = random_seed
     DIAG_CANTON_ID = "1"
     MIN_AGE = 6
     USE_DRAW_DIAG = True
 
     # split ages into 6-15 and 16+
     AGE_SPLIT = 16
-    SEED_PT_YOUTH = 20261
+    SEED_PT_YOUTH = random_seed + 1
 
     # Survey columns (per your assumption)
     SURVEY_TARGET_COL = "subscription"        # values 0..4
@@ -624,14 +634,14 @@ def execute(context):
                 learning_rate=0.05,
                 max_iter=600,
                 min_samples_leaf=80,
-                random_state=42
+                random_state=random_seed
             )
         elif mt == "rf":
             return RandomForestClassifier(
                 n_estimators=900,
                 max_depth=None,
                 min_samples_leaf=10,
-                random_state=42,
+                random_state=random_seed,
                 n_jobs=-1
             )
         elif mt in ("catboost", "cat"):
@@ -641,7 +651,7 @@ def execute(context):
                 learning_rate=0.03,
                 depth=10,
                 l2_leaf_reg=6.0,
-                random_seed=42,
+                random_seed=random_seed,
                 verbose=False,
                 bootstrap_type="Bernoulli",
                 subsample=0.8
@@ -937,6 +947,7 @@ def execute(context):
        'is_student', 'ovgk', "sp_region",
        'driving_license', 'number_of_cars_class', 'car_availability', 'bike_availability', 'PT_SUB_draw', 'mz_person_id', 'is_car_passenger',
        'income_class', 'is_crossing_the_border', 'destination_country_raw']
+    keep_columns += [name for name in pop_df if name.startswith("non_private_") or name == "is_synthetic_household"]
     pop_df = pop_df[keep_columns]
     pop_df = pop_df.rename(columns={"PT_SUB_draw": "pt_subscription"})
 
@@ -946,4 +957,5 @@ def execute(context):
     ]:
         pop_df[column] = pd.to_numeric(pop_df[column], errors="raise").astype("int64")
 
+    pop_df["car_availability"] = binary_code_series(pop_df["car_availability"])
     return pop_df

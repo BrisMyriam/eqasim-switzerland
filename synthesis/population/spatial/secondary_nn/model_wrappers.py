@@ -1,8 +1,8 @@
+import joblib
 import numpy as np
 from .location_helpers import _prepare_destination_level2_index, _reverse_tree
 import torch
 import logging
-import h3
 from sklearn.neighbors import KDTree
 from .feature_encoding import (CANDIDATE_FEATURES, STATIC_CANDIDATE_FEATURES, DYNAMIC_CANDIDATE_FEATURES, N_PERSON_STATIC,
                                transform_candidate_static_matrix, transform_candidate_dynamic_matrix, transform_person_static_vector, 
@@ -10,7 +10,9 @@ from .feature_encoding import (CANDIDATE_FEATURES, STATIC_CANDIDATE_FEATURES, DY
 
 from .choice_model import NeuralChoiceModel, predict_choice_proba
 from .hierarchical_utils import build_dynamic_vector, ORIGIN_PURPOSE_REMAP
-from .h3 import H3_LEVELS
+from .tools import (base_activity_purpose, destination_support_masks, require_purpose_mask,
+                    origin_candidate_indices, DistanceDestinationSampler, MOBILITY_FEATURES,
+                    pt_destination_support, soft_pt_weights)
 
 def _torch_load_checkpoint(path, map_location=None):
     try:
@@ -24,6 +26,8 @@ def _to_float_array(values):
 
 
 def _candidate_column_indices(candidate_cols):
+    if list(candidate_cols) != CANDIDATE_FEATURES:
+        raise ValueError("Retrain secondary_nn models: the candidate feature schema has changed")
     static_indices = [candidate_cols.index(name) for name in STATIC_CANDIDATE_FEATURES]
     dynamic_indices = [candidate_cols.index(name) for name in DYNAMIC_CANDIDATE_FEATURES]
     return static_indices, dynamic_indices
@@ -157,16 +161,14 @@ class RegionalChoiceWrapper:
             purpose_categories=state["purpose_categories"],
         )
 
-    def predict_from_inputs(self, person_matrix, candidate_static, candidate_dynamic, candidate_mask=None, rng=None, return_probabilities=False, internal_mask=False, purpose=None):
+    def predict_from_inputs(self, person_matrix, candidate_static, candidate_dynamic, candidate_mask=None, rng=None, return_probabilities=False, internal_mask=False, purpose=None, candidate_weights=None):
         if internal_mask:
-            cand_mask = self.mask.get(purpose)
-            if cand_mask is None:
-                cand_mask = self.mask.get("statent")
+            cand_mask = require_purpose_mask(self.mask, purpose)
         else:
             cand_mask = candidate_mask
         p_static  = person_matrix[:, :N_PERSON_STATIC]
         p_dynamic = person_matrix[:, N_PERSON_STATIC:]
-        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, cand_mask)
+        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, cand_mask, candidate_weights=candidate_weights)
         probs = probs.cpu().numpy()
         chooser = np.random.choice if rng is None else rng.choice
         indices = np.array([chooser(probs.shape[1], p=probs[i]) for i in range(probs.shape[0])], dtype=np.int64)
@@ -180,7 +182,7 @@ class RegionalChoiceWrapper:
     def predict_level0(self, home_x, home_y, work_x, work_y, origin_x, origin_y, age, sex, employed, car_availability, income_class,
                        daily_longest_distance_from_home, daily_crowfly_total, daily_longest_distance_from_work,
                        crowfly_consumed_before_trip, trip_position_class, departure_time_normalized, target_distance, activity_chain_vector, purpose, origin_purpose,
-                       candidate_mask=None, rng=None):
+                       candidate_mask=None, rng=None, chain_state_vector=None, mobility_vector=None):
         safe_daily_longest = float(daily_longest_distance_from_home) if np.isfinite(daily_longest_distance_from_home) and float(daily_longest_distance_from_home) >= 0.0 else 0.0
         safe_daily_total = float(daily_crowfly_total) if np.isfinite(daily_crowfly_total) and float(daily_crowfly_total) >= 0.0 else 0.0
         safe_daily_longest_work = float(daily_longest_distance_from_work) if np.isfinite(daily_longest_distance_from_work) and float(daily_longest_distance_from_work) >= 0.0 else 0.0
@@ -199,7 +201,8 @@ class RegionalChoiceWrapper:
             sex=sex, employed=employed, car_availability=car_availability,
             consumed_before=safe_consumed, trip_position=safe_trip_position, departure_time=safe_departure_time, target_distance=safe_target_distance,
             purpose_hot=purpose_hot, origin_purpose_hot=origin_purpose_hot,
-            static_scaler=self.person_static_scaler, dynamic_scaler=self.person_dynamic_scaler)
+            static_scaler=self.person_static_scaler, dynamic_scaler=self.person_dynamic_scaler,
+            chain_state_vector=chain_state_vector, mobility_vector=mobility_vector)
         has_work = np.isfinite(work_x) and np.isfinite(work_y)
         candidate_dynamic        = self._build_candidate_dynamic(home_x, home_y, work_x, work_y, origin_x, origin_y, has_work)
         candidate_dynamic_scaled = transform_candidate_dynamic_matrix(candidate_dynamic, self.candidate_dynamic_scaler)[None, :, :]
@@ -213,7 +216,7 @@ class RegionalChoiceWrapper:
         masks["statent"]   = torch.tensor(self.static_candidate_features[:, static_pos["num_statent"]] > 0.0, dtype=torch.bool)
         masks["shop"]      = torch.tensor(self.static_candidate_features[:, static_pos["shop"]]        > 0.0, dtype=torch.bool)
         masks["leisure"]   = torch.tensor(self.static_candidate_features[:, static_pos["leisure"]]     > 0.0, dtype=torch.bool)
-        masks["education_secondary"] = torch.tensor(self.static_candidate_features[:, static_pos["education"]]   > 0.0, dtype=torch.bool)
+        masks["education"] = torch.tensor(self.static_candidate_features[:, static_pos["education"]]   > 0.0, dtype=torch.bool)
         return masks
 
 
@@ -300,23 +303,16 @@ class DistrictChoiceWrapper:
         )
 
     def predict_from_inputs(self, person_matrix, candidate_static, candidate_dynamic, valid_mask=None, rng=None, return_probabilities=False,
-                            internal_mask=False, purpose=None, level0_h3=None):
+                            internal_mask=False, purpose=None, level0_h3=None, candidate_weights=None):
         if internal_mask:
             if level0_h3 is None:
                 raise ValueError("level0_h3 must be provided when using internal_mask")
-            level_cand_mask = self.mask.get(level0_h3)
-            if level_cand_mask is None:
-                self.logger.warning(f"No candidate mask found for level0_h3 '{level0_h3}'; no internal mask will be applied")
-                cand_mask = None
-            else:
-                cand_mask = level_cand_mask.get(purpose)
-                if cand_mask is None:
-                    cand_mask = level_cand_mask.get("statent")
+            cand_mask = require_purpose_mask(self.mask[level0_h3], purpose)
         else:
             cand_mask = valid_mask
         p_static  = person_matrix[:, :N_PERSON_STATIC]
         p_dynamic = person_matrix[:, N_PERSON_STATIC:]
-        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, cand_mask)
+        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, cand_mask, candidate_weights=candidate_weights)
         probs = probs.cpu().numpy()
         chooser = np.random.choice if rng is None else rng.choice
         indices = np.array([chooser(probs.shape[1], p=probs[i]) for i in range(probs.shape[0])], dtype=np.int64)
@@ -337,7 +333,7 @@ class DistrictChoiceWrapper:
                 "statent":             sf[:, _si["num_statent"]] > 0.0,
                 "shop":                sf[:, _si["shop"]]        > 0.0,
                 "leisure":             sf[:, _si["leisure"]]     > 0.0,
-                "education_secondary": sf[:, _si["education"]]   > 0.0,
+                "education":           sf[:, _si["education"]]   > 0.0,
             }
         return masks
 
@@ -419,23 +415,17 @@ class LocalChoiceWrapper:
         )
 
     def predict_from_inputs(self, person_matrix, candidate_static, candidate_dynamic, valid_mask=None, rng=None, return_probabilities=False,
-                            internal_mask=False, purpose=None, level0_h3=None, level1_h3=None):
+                            internal_mask=False, purpose=None, level0_h3=None, level1_h3=None, candidate_weights=None):
         if internal_mask:
             if level0_h3 is None or level1_h3 is None:
                 raise ValueError("level0_h3 and level1_h3 must be provided when using internal_mask")
             key = (level0_h3, level1_h3)
-            level_cand_mask = self.mask.get(key)
-            if level_cand_mask is None:
-                cand_mask = None
-            else:
-                cand_mask = level_cand_mask.get(purpose)
-                if cand_mask is None:
-                    cand_mask = level_cand_mask.get("statent")
+            cand_mask = require_purpose_mask(self.mask[key], purpose)
         else:
             cand_mask = valid_mask
         p_static  = person_matrix[:, :N_PERSON_STATIC]
         p_dynamic = person_matrix[:, N_PERSON_STATIC:]
-        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, cand_mask)
+        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, cand_mask, candidate_weights=candidate_weights)
         probs = probs.cpu().numpy()
         chooser = np.random.choice if rng is None else rng.choice
         indices = np.array([chooser(probs.shape[1], p=probs[i]) for i in range(probs.shape[0])], dtype=np.int64)
@@ -476,7 +466,8 @@ class LocalChoiceWrapper:
             sex=sex, employed=employed, car_availability=car_availability,
             consumed_before=safe_consumed, trip_position=safe_trip_position, departure_time=safe_departure_time, target_distance=safe_target_distance,
             purpose_hot=purpose_hot, origin_purpose_hot=origin_purpose_hot,
-            static_scaler=self.person_static_scaler, dynamic_scaler=self.person_dynamic_scaler)
+            static_scaler=self.person_static_scaler, dynamic_scaler=self.person_dynamic_scaler,
+            chain_state_vector=kwargs.get("chain_state_vector"), mobility_vector=kwargs.get("mobility_vector"))
         has_work = np.isfinite(work_x) and np.isfinite(work_y)
         candidate_dynamic        = self._build_candidate_dynamic(attrs, home_x, home_y, work_x, work_y, origin_x, origin_y, has_work)
         candidate_dynamic_scaled = transform_candidate_dynamic_matrix(candidate_dynamic, self.candidate_dynamic_scaler)[None, :, :]
@@ -506,7 +497,7 @@ class LocalChoiceWrapper:
                 "statent":             sf[:, _si["num_statent"]] > 0.0,
                 "shop":                sf[:, _si["shop"]]        > 0.0,
                 "leisure":             sf[:, _si["leisure"]]     > 0.0,
-                "education_secondary": sf[:, _si["education"]]   > 0.0,
+                "education":           sf[:, _si["education"]]   > 0.0,
             }
         return masks
 
@@ -603,13 +594,13 @@ class ShortRangeChoiceWrapper:
         masks["statent"] = torch.tensor(self.static_candidate_features[:, static_pos["num_statent"]] > 0.0, dtype=torch.bool)
         masks["shop"] = torch.tensor(self.static_candidate_features[:, static_pos["shop"]] > 0.0, dtype=torch.bool)
         masks["leisure"] = torch.tensor(self.static_candidate_features[:, static_pos["leisure"]] > 0.0, dtype=torch.bool)
-        masks["education_secondary"] = torch.tensor(self.static_candidate_features[:, static_pos["education"]] > 0.0, dtype=torch.bool)
+        masks["education"] = torch.tensor(self.static_candidate_features[:, static_pos["education"]] > 0.0, dtype=torch.bool)
         return masks
 
-    def predict_from_inputs(self, person_matrix, candidate_static, candidate_dynamic, candidate_mask=None, rng=None, return_probabilities=False):
+    def predict_from_inputs(self, person_matrix, candidate_static, candidate_dynamic, candidate_mask=None, rng=None, return_probabilities=False, candidate_weights=None):
         p_static = person_matrix[:, :N_PERSON_STATIC]
         p_dynamic = person_matrix[:, N_PERSON_STATIC:]
-        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, candidate_mask)
+        probs = predict_choice_proba(self.model, p_static, p_dynamic, candidate_static, candidate_dynamic, candidate_mask, candidate_weights=candidate_weights)
         probs = probs.cpu().numpy()
         chooser = np.random.choice if rng is None else rng.choice
         indices = np.array([chooser(probs.shape[1], p=probs[i]) for i in range(probs.shape[0])], dtype=np.int64)
@@ -620,66 +611,13 @@ class ShortRangeChoiceWrapper:
     def _query_candidate_indices(self, origin_x, origin_y, radius_m, min_candidates, pad_to_min=True,
                                  expand_step_m=None, support_mask=None):
         if self._kdtree is None:
-            return np.arange(len(self.all_h3), dtype=np.int64)
-
-        center = np.array([[float(origin_x), float(origin_y)]], dtype=np.float64)
-        radius = float(max(radius_m, 0.0))
-        min_candidates = max(1, int(min_candidates))
-        support_mask = support_mask if support_mask is not None else self.mask["statent"]
-
-        # Simple one-shot query path (legacy behavior).
-        if expand_step_m is None:
-            nearby = self._kdtree.query_radius(center, r=radius, return_distance=False)[0]
-            if pad_to_min and nearby.size < min_candidates:
-                k = min(min_candidates, len(self.all_h3))
-                nearest = self._kdtree.query(center, k=k, return_distance=False)[0]
-                nearby = np.unique(np.concatenate([nearby, nearest]))
-
-            if nearby.size == 0:
-                fallback_n = min(len(self.all_h3), min_candidates)
-                nearby = np.arange(fallback_n, dtype=np.int64)
-
-            return nearby.astype(np.int64)
-
-        step_radius = max(1.0, float(expand_step_m))
-        search_radius = radius
-
-        candidate_indices = np.empty(0, dtype=np.int64)
-        while True:
-            nearby_all = self._kdtree.query_radius(center, r=search_radius, return_distance=False)[0].astype(np.int64)
-            if nearby_all.size > 0:
-                probe_idx = torch.as_tensor(nearby_all, dtype=torch.long)
-                local_support = support_mask.index_select(0, probe_idx)
-                candidate_indices = nearby_all[local_support.cpu().numpy()]
-            else:
-                candidate_indices = np.empty(0, dtype=np.int64)
-
-            if candidate_indices.size > 0:
-                break
-            if nearby_all.size >= len(self.all_h3):
-                break
-            search_radius += step_radius
-
-        while candidate_indices.size < min_candidates:
-            search_radius += step_radius
-            nearby_all = self._kdtree.query_radius(center, r=search_radius, return_distance=False)[0].astype(np.int64)
-
-            if nearby_all.size > 0:
-                probe_idx = torch.as_tensor(nearby_all, dtype=torch.long)
-                local_support = support_mask.index_select(0, probe_idx)
-                expanded = nearby_all[local_support.cpu().numpy()]
-                if expanded.size > 0:
-                    candidate_indices = np.unique(np.concatenate([candidate_indices, expanded])).astype(np.int64)
-
-            if nearby_all.size >= len(self.all_h3):
-                break
-
-        if candidate_indices.size == 0 and pad_to_min:
-            # Last-resort path: return at least some nearby zones so caller remains callable.
-            k = min(min_candidates, len(self.all_h3))
-            candidate_indices = self._kdtree.query(center, k=k, return_distance=False)[0].astype(np.int64)
-
-        return candidate_indices.astype(np.int64)
+            raise ValueError("No H3 cells are available for short-range prediction")
+        support = self.mask["statent"] if support_mask is None else support_mask
+        if isinstance(support, torch.Tensor):
+            support = support.detach().cpu().numpy()
+        return origin_candidate_indices(
+            self._kdtree, origin_x, origin_y, support, radius_m=radius_m,
+            min_candidates=min_candidates, expand_step_m=expand_step_m, pad_to_min=pad_to_min)
 
     def _build_candidate_dynamic(self, home_x, home_y, work_x, work_y, origin_x, origin_y, has_work, candidate_indices):
         cx = self.centroid_x[candidate_indices]
@@ -688,7 +626,7 @@ class ShortRangeChoiceWrapper:
 
     def predict_level2_short(self, person_matrix, home_x, home_y, work_x, work_y, origin_x, origin_y, has_work,
                              purpose, target_distance=None, radius_m=200.0, expand_step_m=200.0,
-                             min_candidates=12, rng=None, purpose_supported_mask=None):
+                             min_candidates=12, rng=None, purpose_supported_mask=None, return_distribution=False, candidate_weights=None):
         if len(self.all_h3) == 0:
             raise RuntimeError("No level2 candidates are available in short-range wrapper")
 
@@ -712,6 +650,8 @@ class ShortRangeChoiceWrapper:
             raise RuntimeError("Short-range wrapper returned an empty candidate set")
 
         index_tensor = torch.as_tensor(candidate_indices, dtype=torch.long)
+        local_weights = (None if candidate_weights is None else
+                         torch.as_tensor(candidate_weights).index_select(0, index_tensor))
         candidate_static_scaled = self.scaled_static_features_torch.index_select(1, index_tensor)
 
         candidate_dynamic = self._build_candidate_dynamic(
@@ -737,9 +677,13 @@ class ShortRangeChoiceWrapper:
             candidate_dynamic_scaled = candidate_dynamic.astype(np.float32)[None, :, :]
 
         purpose_key = str(purpose)
-        candidate_mask = self.mask.get(purpose_key, self.mask["statent"]).index_select(0, index_tensor)
-        if not bool(candidate_mask.any().item()):
-            candidate_mask = self.mask["statent"].index_select(0, index_tensor)
+        candidate_mask = require_purpose_mask(self.mask, purpose_key).index_select(0, index_tensor)
+
+        if return_distribution:
+            probabilities = predict_choice_proba(
+                self.model, person_matrix[:, :N_PERSON_STATIC], person_matrix[:, N_PERSON_STATIC:],
+                candidate_static_scaled, candidate_dynamic_scaled, candidate_mask, candidate_weights=local_weights).cpu().numpy()[0]
+            return [self.all_h3[i] for i in candidate_indices], probabilities
 
         idx = self.predict_from_inputs(
             person_matrix,
@@ -748,6 +692,7 @@ class ShortRangeChoiceWrapper:
             candidate_mask=candidate_mask,
             rng=rng,
             return_probabilities=False,
+            candidate_weights=local_weights,
         )
 
         safe_idx = min(int(idx[0]), int(candidate_indices.size) - 1)
@@ -765,9 +710,16 @@ class HierarchicalLocationChoiceModel:
         self.wrappers = dict(coarse=coarse_wrapper, medium=medium_wrapper, detailed=detailed_wrapper)
         if short_wrapper is not None:
             self.wrappers["short"] = short_wrapper
-        self.short_trip_threshold_m = 1000.0
+        self.use_target_distance = "target_distance" in self.c.person_trip_cols
+        self.short_trip_classifier = None
+        self.short_trip_threshold_m = 1500.0
         self.short_query_radius_m = 200.0
-        self.short_min_candidates = 12
+        self.short_min_candidates = 6
+        self.accessibility_weight = 1.0
+        self._apply_pt_weights = False
+        self.short_sampling = "neural"
+        self.short_distance_sigma_fraction = 0.1
+        self.short_distance_sigma_min_m = 25.0
         self.same_person_scaler = self.check_if_similar_person_scalers()
         self.build_internal_state()
         assert self.same_person_scaler, ("Person scalers differ across model levels; this may lead to inconsistent predictions if the same person features are used at multiple levels. "+
@@ -786,8 +738,12 @@ class HierarchicalLocationChoiceModel:
         self.destination_fallback = None
         self.destination_index_xy = None    # {purpose: {level2_h3: np.ndarray [N,2]}} — company (x,y) per L2 pool
         self.destination_fallback_xy = None  # {purpose: {level1_h3: np.ndarray [N,2]}} — company (x,y) per L1 fallback pool
+        self.level2_to_level1 = None
         self.l1_siblings = None  # {level1_h3: [sibling_level1_h3s]} — built once, used for O(1) fallback widening
         self.short_destination_support_masks = None
+        self._short_distance_samplers = {}
+        self._short_distance_pt_weights = {}
+        self._pt_soft_weights = {}
         self.detour_factor = None
         self._current_origin_detour_index = None
         self._coarse_detour_indices = None
@@ -797,7 +753,7 @@ class HierarchicalLocationChoiceModel:
         self._purpose_index = {p: i for i, p in enumerate(self._purpose_categories)}
 
     @classmethod
-    def load(cls, coarse_path:str, medium_path:str, detailed_path:str, short_path:str=None, map_location=None, optimize=True):
+    def load(cls, coarse_path:str, medium_path:str, detailed_path:str, short_path:str=None, map_location=None, optimize=True, short_trip_classifier_path=None):
         cls.log("Loading models")
         coarse_wrapper = RegionalChoiceWrapper.load(coarse_path, map_location=map_location)
         medium_wrapper = DistrictChoiceWrapper.load(medium_path, map_location=map_location)
@@ -805,24 +761,27 @@ class HierarchicalLocationChoiceModel:
         short_wrapper = None
         if short_path is not None:
             short_wrapper = ShortRangeChoiceWrapper.load(short_path, map_location=map_location)
-        return cls(
+        obj = cls(
             coarse_wrapper=coarse_wrapper,
             medium_wrapper=medium_wrapper,
             detailed_wrapper=detailed_wrapper,
             short_wrapper=short_wrapper,
             optimize=optimize,
         )
+        if short_trip_classifier_path is not None:
+            obj.short_trip_classifier = joblib.load(short_trip_classifier_path)
+        return obj
 
     @classmethod
-    def build(cls, context, map_location=None, optimize=True):
+    def build(cls, context, map_location=None, optimize=True, load_selector=True, accessibility_weight=1.0):
         regional_model_path, _, _ = context.stage("synthesis.population.spatial.secondary_nn.regional_model")
         subregional_model_path = context.stage("synthesis.population.spatial.secondary_nn.subregional_model")[0]
         local_model_path = context.stage("synthesis.population.spatial.secondary_nn.local_model")[0]
-        short_model_path = None
-        try:
-            short_model_path = context.stage("synthesis.population.spatial.secondary_nn.short_range_model")[0]
-        except Exception as exc:
-            cls.log(f"Short-range model unavailable, falling back to long-range hierarchy only: {exc}", level=logging.WARNING)
+        short_model_path = context.stage("synthesis.population.spatial.secondary_nn.short_range_model")[0]
+        use_target_distance = bool(context.config("secondary_nn_use_target_distance"))
+        classifier_path = None
+        if not use_target_distance and load_selector:
+            classifier_path = context.stage("synthesis.population.spatial.secondary_nn.short_trip_classifier")[0]
 
         obj = cls.load(
             coarse_path=regional_model_path,
@@ -831,6 +790,7 @@ class HierarchicalLocationChoiceModel:
             short_path=short_model_path,
             map_location=map_location,
             optimize=optimize,
+            short_trip_classifier_path=classifier_path,
         )
         try:
             obj.short_trip_threshold_m = float(context.config("secondary_nn_short_trip_threshold_m"))
@@ -839,19 +799,62 @@ class HierarchicalLocationChoiceModel:
         except Exception:
             # Keep safe defaults when config keys are not declared by caller.
             pass
+        if ("target_distance" in obj.c.person_trip_cols) != bool(context.config("secondary_nn_use_target_distance")):
+            raise ValueError("Retrain secondary_nn models for the configured target-distance option")
+        if "remaining_distance_budget_m" not in obj.c.person_trip_cols:
+            raise ValueError("Retrain all secondary_nn experts with remaining-chain features")
+        if not use_target_distance and load_selector and not hasattr(obj.short_trip_classifier, "feature_scaler"):
+            raise ValueError("Retrain the distance-free selector as a cross-fitted probabilistic mixture")
+        obj.accessibility_weight = float(accessibility_weight)
+        if not np.isfinite(obj.accessibility_weight) or not 0 < obj.accessibility_weight <= 1:
+            raise ValueError("Accessibility weight must lie in (0, 1]")
+        from .tools import AccessibilityLookup
+        obj.origin_accessibility = AccessibilityLookup(context.stage("data.spatial.ovgk"))
         obj.build_candidates_and_trees(context)
+        if use_target_distance:
+            # Missing controls identify legacy completed runs, which used neural leaf selection.
+            obj.short_sampling = context.config("secondary_nn_short_sampling") or "neural"
+            if obj.short_sampling not in ("distance", "neural"):
+                raise ValueError("secondary_nn_short_sampling must be distance or neural")
+            fraction = context.config("secondary_nn_short_distance_sigma_fraction")
+            floor = context.config("secondary_nn_short_distance_sigma_min_m")
+            obj.short_distance_sigma_fraction = 0.1 if fraction is None else float(fraction)
+            obj.short_distance_sigma_min_m = 25.0 if floor is None else float(floor)
+            if (not np.isfinite([obj.short_distance_sigma_fraction, obj.short_distance_sigma_min_m]).all()
+                    or min(obj.short_distance_sigma_fraction, obj.short_distance_sigma_min_m) <= 0):
+                raise ValueError("Short-range distance kernel widths must be finite and positive")
         return obj
     
     def build_candidates_and_trees(self, context):
         h3_data, h3_geo, h3_tree = context.stage("synthesis.population.spatial.secondary_nn.h3")
+        self._validate_coordinate_tree(h3_tree)
         (self.destination_index, self.destination_fallback, self.car_available_probabilities,
             self.no_car_available_probabilities, self.destination_index_xy,
-            self.destination_fallback_xy) = _prepare_destination_level2_index(context, h3_data, h3_geo)
+            self.destination_fallback_xy) = _prepare_destination_level2_index(context, h3_data, h3_geo,
+                no_pt_weight=self.accessibility_weight if self.accessibility_weight < 1 else .01)
+        self.level2_to_level1 = {leaf: middle for branches in h3_tree.values() for middle, leaves in branches.items() for leaf in leaves}
         self.l1_siblings = _reverse_tree(h3_tree)  # {level1: [sibling_level1s]} — built once for O(1) fallback widening
-        self._build_short_destination_support_masks()
+        self._build_destination_support_masks(h3_tree)
+        if self.accessibility_weight < 1:
+            self._build_pt_soft_weights(h3_tree, h3_data, context.stage("synthesis.population.destinations"))
         self._build_detour_factor_cache(
             context.stage("synthesis.population.spatial.secondary.detour_factors.factors")
         )
+
+    def _validate_coordinate_tree(self, tree):
+        """Reject stale checkpoints before prediction can mix incompatible branches."""
+        expected_middle = {root: set(branches) for root, branches in tree.items()}
+        expected_leaves = {(root, middle): set(leaves)
+                           for root, branches in tree.items() for middle, leaves in branches.items()}
+        actual_middle = {root: set(attrs["children"])
+                         for root, attrs in self.m.level1_candidate_attributes_by_level0.items()}
+        actual_leaves = {key: set(attrs["children"])
+                         for key, attrs in self.d.level2_candidate_attributes_by_level1.items()}
+        if (set(self.c.all_h3) != set(tree) or actual_middle != expected_middle
+                or actual_leaves != expected_leaves):
+            raise ValueError("Retrain secondary_nn models for the current coordinate-based destination tree")
+        if self.s is not None and set(self.s.all_h3) != set().union(*expected_leaves.values()):
+            raise ValueError("Retrain the short-range model for the current coordinate-based destination tree")
 
     def _build_detour_factor_cache(self, detour_factor):
         """Snap all fixed candidate centroids once for fast prediction lookups."""
@@ -882,32 +885,81 @@ class HierarchicalLocationChoiceModel:
             factors[int(n_children):] = 0.0
         return np.column_stack([candidate_dynamic, factors]).astype(np.float32)
 
-    def _build_short_destination_support_masks(self):
-        self.short_destination_support_masks = None
-        if self.s is None or self.destination_index is None:
-            return
+    def _build_destination_support_masks(self, tree):
+        """Propagate actual facility eligibility from leaves to every ancestor."""
+        purposes = self._purpose_categories
+        leaf_pools = self.destination_index
+        middle_pools = {}
+        root_pools = {}
+        for purpose in purposes:
+            base = base_activity_purpose(purpose)
+            eligible = leaf_pools[base]
+            middle_pools[base] = {
+                middle: any(bool(eligible.get(leaf)) for leaf in leaves)
+                for branches in tree.values() for middle, leaves in branches.items()
+            }
+            root_pools[base] = {
+                root: any(middle_pools[base][middle] for middle in branches)
+                for root, branches in tree.items()
+            }
 
-        h3_to_idx = {str(h): i for i, h in enumerate(self.s.all_h3)}
-        masks = {}
-        for purpose in self._purpose_categories:
-            supported = torch.zeros(len(self.s.all_h3), dtype=torch.bool)
-            purpose_index = self.destination_index.get(purpose, {})
-            for level2_h3, pool in purpose_index.items():
-                if not pool:
-                    continue
-                idx = h3_to_idx.get(str(level2_h3))
-                if idx is not None:
-                    supported[idx] = True
-            if not bool(supported.any().item()):
-                other_index = self.destination_index.get("other", {})
-                for level2_h3, pool in other_index.items():
-                    if not pool:
-                        continue
-                    idx = h3_to_idx.get(str(level2_h3))
-                    if idx is not None:
-                        supported[idx] = True
-            masks[purpose] = supported
-        self.short_destination_support_masks = masks
+        # Padded alternatives stay false; a selected parent always has a valid child.
+        coarse = destination_support_masks(self.c.all_h3, root_pools, purposes)
+        self.c.mask = {key: torch.as_tensor(value) for key, value in coarse.items()}
+        self.m.mask = {
+            root: destination_support_masks(
+                attrs["children"] + [None] * (len(attrs["x"]) - len(attrs["children"])),
+                middle_pools, purposes)
+            for root, attrs in self.m.level1_candidate_attributes_by_level0.items()
+        }
+        self.d.mask = {
+            key: destination_support_masks(
+                attrs["children"] + [None] * (len(attrs["x"]) - len(attrs["children"])),
+                leaf_pools, purposes)
+            for key, attrs in self.d.level2_candidate_attributes_by_level1.items()
+        }
+        self.short_destination_support_masks = None
+        if self.s is not None:
+            masks = destination_support_masks(self.s.all_h3, leaf_pools, purposes)
+            self.s.mask = {key: torch.as_tensor(value) for key, value in masks.items()}
+            self.short_destination_support_masks = self.s.mask
+
+    def _build_pt_soft_weights(self, tree, h3_data, destinations):
+        roots, middle, leaves = pt_destination_support(h3_data, destinations, tree, self._purpose_categories)
+        self._pt_accessible_ids = set(destinations.loc[destinations.ovgk.isin(["A", "B", "C", "D"]), "destination_id"])
+        weight = self.accessibility_weight
+        self._pt_soft_weights = dict(
+            coarse=soft_pt_weights(self.c.all_h3, roots, self._purpose_categories, weight),
+            medium={root: soft_pt_weights(
+                attrs["children"] + [None] * (len(attrs["x"]) - len(attrs["children"])),
+                middle, self._purpose_categories, weight)
+                for root, attrs in self.m.level1_candidate_attributes_by_level0.items()},
+            detailed={key: soft_pt_weights(
+                attrs["children"] + [None] * (len(attrs["x"]) - len(attrs["children"])),
+                leaves, self._purpose_categories, weight)
+                for key, attrs in self.d.level2_candidate_attributes_by_level1.items()},
+            short=soft_pt_weights(self.s.all_h3, leaves, self._purpose_categories, weight))
+
+    def _with_origin_accessibility(self, state, origin_x, origin_y):
+        if state is None or "origin_ovgk" not in self.c.person_trip_cols:
+            return state
+        from .chain_state import CHAIN_STATE_FEATURES
+        result = np.asarray(state, dtype=np.float32).copy()
+        result[CHAIN_STATE_FEATURES.index("origin_ovgk")] = self.origin_accessibility.at(origin_x, origin_y)
+        return result
+
+    def _set_accessibility_person(self, car_available, mobility_vector):
+        policy = getattr(self, "accessibility_weight", 1.) < 1
+        licence = (mobility_vector is not None and
+                   np.asarray(mobility_vector).reshape(-1)[MOBILITY_FEATURES.index("driving_license")] > .5)
+        self._current_can_drive = bool(car_available) and (bool(licence) if policy else True)
+        self._apply_pt_weights = policy and not self._current_can_drive
+
+    def _pt_weights(self, level, purpose, key=None):
+        if not getattr(self, "_apply_pt_weights", False):
+            return None
+        weights = self._pt_soft_weights[level]
+        return require_purpose_mask(weights if key is None else weights[key], purpose)
 
     @classmethod
     def log(cls, message, level=logging.INFO):
@@ -1046,17 +1098,19 @@ class HierarchicalLocationChoiceModel:
             )
 
     def assert_ready_for_prediction(self):
+        if not self.use_target_distance and (self.short_trip_classifier is None or self.s is None):
+            raise RuntimeError("Distance-free model selection requires the short-trip classifier and short-range model")
         assert self.destination_index is not None and self.destination_fallback is not None and self.l1_siblings is not None, (
             "Destination pools / sibling map are not initialized. Call build_candidates_and_trees(context) before predict()."
         )
 
-    def _get_cached_person_static(self, person_id, age, income_class, daily_longest, daily_total, daily_longest_work, activity_chain_vector, sex, employed, car_availability):
+    def _get_cached_person_static(self, person_id, age, income_class, daily_longest, daily_total, daily_longest_work, activity_chain_vector, sex, employed, car_availability, mobility_vector=None):
         if person_id != self._last_person_id:
-            self._last_person_static = transform_person_static_vector(age, income_class, daily_longest, daily_total, daily_longest_work, activity_chain_vector, sex, employed, car_availability, self.c.person_static_scaler)
+            self._last_person_static = transform_person_static_vector(age, income_class, daily_longest, daily_total, daily_longest_work, activity_chain_vector, sex, employed, car_availability, self.c.person_static_scaler, mobility_vector=mobility_vector)
             self._last_person_id = person_id
         return self._last_person_static
 
-    def _build_person_dynamic(self, consumed_before, trip_position, departure_time, activity_duration_h, target_distance, purpose, origin_purpose):
+    def _build_person_dynamic(self, consumed_before, trip_position, departure_time, activity_duration_h, target_distance, purpose, origin_purpose, chain_state_vector=None):
         purpose_key = str(purpose)
         purpose_idx = self._purpose_index.get(purpose_key, self._purpose_index.get("other", 0))
         purpose_hot = self._purpose_identity[purpose_idx]
@@ -1068,14 +1122,14 @@ class HierarchicalLocationChoiceModel:
         else:
             # Match training-time behavior for unknown origin purpose: all-zero one-hot.
             origin_purpose_hot = np.zeros(len(self._purpose_categories), dtype=np.float32)
-        return transform_person_dynamic_vector(consumed_before, trip_position, departure_time, activity_duration_h, target_distance, purpose_hot, origin_purpose_hot, self.c.person_dynamic_scaler)
+        return transform_person_dynamic_vector(consumed_before, trip_position, departure_time, activity_duration_h, target_distance, purpose_hot, origin_purpose_hot, self.c.person_dynamic_scaler, chain_state_vector=chain_state_vector)
 
     def _predict_level0_from_person(self, person_matrix, home_x, home_y, work_x, work_y, origin_x, origin_y, has_work, rng, purpose):
         candidate_dynamic = self.c._build_candidate_dynamic(home_x, home_y, work_x, work_y, origin_x, origin_y, has_work)
         candidate_dynamic = self._add_cached_detour_feature(candidate_dynamic, self._coarse_detour_indices)
         candidate_dynamic_scaled = transform_candidate_dynamic_matrix(candidate_dynamic, self.c.candidate_dynamic_scaler)[None, :, :]
         candidate_static_scaled  = self.c.scaled_static_features_torch
-        indices = self.c.predict_from_inputs(person_matrix, candidate_static_scaled, candidate_dynamic_scaled, rng=rng, return_probabilities=False, internal_mask=True, purpose=purpose)
+        indices = self.c.predict_from_inputs(person_matrix, candidate_static_scaled, candidate_dynamic_scaled, rng=rng, return_probabilities=False, internal_mask=True, purpose=purpose, candidate_weights=self._pt_weights("coarse", purpose))
         return self.c.all_h3[indices[0]]
 
     def _predict_level1_from_person(self, person_matrix, level0_h3, home_x, home_y, work_x, work_y, origin_x, origin_y, has_work, purpose, rng):
@@ -1090,7 +1144,7 @@ class HierarchicalLocationChoiceModel:
         candidate_dynamic = self._add_cached_detour_feature(candidate_dynamic, attrs["detour_cell_indices"], n_children)
         candidate_dynamic_scaled = transform_candidate_dynamic_matrix(candidate_dynamic, self.m.candidate_dynamic_scaler)[None, :, :]
         candidate_static_scaled  = attrs["scaled_static_features_torch"]
-        idx = self.m.predict_from_inputs(person_matrix, candidate_static_scaled, candidate_dynamic_scaled, rng=rng, return_probabilities=False, internal_mask=True, purpose=purpose, level0_h3=level0_h3)
+        idx = self.m.predict_from_inputs(person_matrix, candidate_static_scaled, candidate_dynamic_scaled, rng=rng, return_probabilities=False, internal_mask=True, purpose=purpose, level0_h3=level0_h3, candidate_weights=self._pt_weights("medium", purpose, level0_h3))
         safe_idx = min(int(idx[0]), n_children - 1)
         return children[safe_idx]
 
@@ -1107,7 +1161,7 @@ class HierarchicalLocationChoiceModel:
         candidate_dynamic = self._add_cached_detour_feature(candidate_dynamic, attrs["detour_cell_indices"], n_children)
         candidate_dynamic_scaled = transform_candidate_dynamic_matrix(candidate_dynamic, self.d.candidate_dynamic_scaler)[None, :, :]
         candidate_static_scaled  = attrs["scaled_static_features_torch"]
-        idx = self.d.predict_from_inputs(person_matrix, candidate_static_scaled, candidate_dynamic_scaled, rng=rng, return_probabilities=False, internal_mask=True, purpose=purpose, level0_h3=level0_h3, level1_h3=level1_h3)
+        idx = self.d.predict_from_inputs(person_matrix, candidate_static_scaled, candidate_dynamic_scaled, rng=rng, return_probabilities=False, internal_mask=True, purpose=purpose, level0_h3=level0_h3, level1_h3=level1_h3, candidate_weights=self._pt_weights("detailed", purpose, key))
         safe_idx = min(int(idx[0]), n_children - 1)
         return children[safe_idx]
 
@@ -1135,15 +1189,54 @@ class HierarchicalLocationChoiceModel:
             min_candidates=self.short_min_candidates,
             rng=rng,
             purpose_supported_mask=support_mask,
+            candidate_weights=self._pt_weights("short", purpose),
         )
+
+    def _select_short_model(self, *, target_distance, rng=None, **features):
+        if self.use_target_distance:
+            selected = self.s is not None and target_distance <= float(self.short_trip_threshold_m)
+            self.last_short_probability = float(selected)
+            return selected
+        if self.short_trip_classifier is None or self.s is None:
+            raise RuntimeError("Distance-free model selection requires the short-trip classifier and short-range model")
+        if rng is None:
+            raise ValueError("Probabilistic expert selection requires the configured random generator")
+        probability = self.short_trip_classifier.predict_probability(**features)
+        self.last_short_probability = probability
+        return bool(rng.random() < probability)
+
+    def sample_short_by_distance(self, purpose, origin_x, origin_y, target_distance, rng):
+        """Match supplied distance before selecting a leaf, using actual eligible facilities."""
+        base = base_activity_purpose(purpose)
+        cells = self.s._query_candidate_indices(
+            origin_x, origin_y, self.short_trip_threshold_m + self.short_query_radius_m * 1.5,
+            self.short_min_candidates, expand_step_m=self.short_query_radius_m,
+            support_mask=require_purpose_mask(self.short_destination_support_masks, purpose))
+        if base not in self._short_distance_samplers:
+            self._short_distance_samplers[base] = DistanceDestinationSampler(
+                self.s.all_h3, self.destination_index[base], self.destination_index_xy[base])
+        sampler = self._short_distance_samplers[base]
+        facility_weights = None
+        if getattr(self, "_apply_pt_weights", False):
+            if base not in self._short_distance_pt_weights:
+                self._short_distance_pt_weights[base] = np.asarray([
+                    1. if facility[0] in self._pt_accessible_ids else self.accessibility_weight
+                    for facility in sampler.facilities], dtype=np.float32)
+            facility_weights = self._short_distance_pt_weights[base]
+        return self._short_distance_samplers[base].sample(
+            cells, origin_x, origin_y, target_distance, rng,
+            facility_weights=facility_weights,
+            sigma_fraction=self.short_distance_sigma_fraction, sigma_min_m=self.short_distance_sigma_min_m)
 
     ##################### Main prediction method that runs the full three-level prediction process #####################
 
     def predict(self, person_id, home_x, home_y, work_x, work_y, origin_x, origin_y, age, daily_longest_distance_from_home, daily_crowfly_total, daily_longest_distance_from_work,
             crowfly_consumed_before_trip, trip_position_class, departure_time_normalized, activity_duration_h, target_distance, activity_chain_vector, sex, employed, car_availability, income_class, purpose, origin_purpose,
-                has_work, has_education, rng):
-        person_static  = self._get_cached_person_static(person_id, age, income_class, daily_longest_distance_from_home, daily_crowfly_total, daily_longest_distance_from_work, activity_chain_vector, sex, employed, car_availability)
-        person_dynamic = self._build_person_dynamic(crowfly_consumed_before_trip, trip_position_class, departure_time_normalized, activity_duration_h, target_distance, purpose, origin_purpose)
+                has_work, has_education, rng, mobility_vector=None, force_expert=None, chain_state_vector=None):
+        chain_state_vector = self._with_origin_accessibility(chain_state_vector, origin_x, origin_y)
+        self._set_accessibility_person(car_availability, mobility_vector)
+        person_static  = self._get_cached_person_static(person_id, age, income_class, daily_longest_distance_from_home, daily_crowfly_total, daily_longest_distance_from_work, activity_chain_vector, sex, employed, car_availability, mobility_vector)
+        person_dynamic = self._build_person_dynamic(crowfly_consumed_before_trip, trip_position_class, departure_time_normalized, activity_duration_h, target_distance, purpose, origin_purpose, chain_state_vector=chain_state_vector)
         person_matrix  = np.concatenate([person_static, person_dynamic], axis=1)
         self._current_origin_detour_index = int(
             self.detour_factor.get_cell_indices(origin_x, origin_y)[0]
@@ -1152,7 +1245,28 @@ class HierarchicalLocationChoiceModel:
             self.s._current_origin_detour_index = self._current_origin_detour_index
 
         safe_target_distance = float(target_distance) if np.isfinite(target_distance) and float(target_distance) >= 0.0 else np.inf
-        use_short = self.s is not None and safe_target_distance <= float(self.short_trip_threshold_m)
+        if force_expert not in (None, "short", "hierarchy"):
+            raise ValueError("force_expert must be short or hierarchy")
+        use_short = force_expert == "short" if force_expert is not None else self._select_short_model(
+            target_distance=safe_target_distance, rng=rng, age=age, income_class=income_class,
+            daily_longest=daily_longest_distance_from_home, daily_total=daily_crowfly_total,
+            daily_longest_work=daily_longest_distance_from_work, activity_chain_vector=activity_chain_vector,
+            sex=sex, employed=employed, car_availability=car_availability,
+            consumed_before=crowfly_consumed_before_trip, trip_position=trip_position_class,
+            departure_time=departure_time_normalized, activity_duration_h=activity_duration_h,
+            purpose=purpose, origin_purpose=origin_purpose,
+            mobility_vector=mobility_vector, origin_x=origin_x, origin_y=origin_y,
+            home_x=home_x, home_y=home_y, work_x=work_x, work_y=work_y, has_work=has_work,
+            chain_state_vector=chain_state_vector,
+        )
+        self.last_selected_expert = "short" if use_short else "hierarchy"
+        if force_expert is not None:
+            self.last_short_probability = float(use_short)
+
+        # A supplied short-trip radius selects facilities directly, without a neural leaf bottleneck.
+
+        if use_short and self.use_target_distance and self.short_sampling == "distance":
+            return self.sample_short_by_distance(purpose, origin_x, origin_y, safe_target_distance, rng)
 
         if use_short:
             level2_h3 = self._predict_short_level2_from_person(
@@ -1168,10 +1282,7 @@ class HierarchicalLocationChoiceModel:
                 target_distance=safe_target_distance,
                 rng=rng,
             )
-            try:
-                level1_h3 = str(h3.cell_to_parent(level2_h3, H3_LEVELS[1]))
-            except Exception:
-                level1_h3 = str(level2_h3)
+            level1_h3 = self.level2_to_level1[level2_h3]
         else:
             level0_h3 = self._predict_level0_from_person(person_matrix, home_x=home_x, home_y=home_y, work_x=work_x, work_y=work_y, origin_x=origin_x, origin_y=origin_y,
                                                          has_work=has_work, rng=rng, purpose=purpose)
@@ -1181,9 +1292,78 @@ class HierarchicalLocationChoiceModel:
                                                          work_y=work_y, origin_x=origin_x, origin_y=origin_y, has_work=has_work, purpose=purpose, rng=rng)
 
         destination_id, geom = self.sample_company_in_l2(
-            purpose, level1_h3, level2_h3, rng, car_availability, home_x, home_y,
-            origin_x=origin_x, origin_y=origin_y, target_distance=target_distance)
+            purpose, level1_h3, level2_h3, rng, self._current_can_drive, home_x, home_y,
+            origin_x=origin_x, origin_y=origin_y, target_distance=target_distance if self.use_target_distance else None)
         return destination_id, geom
+
+    def expert_leaf_probabilities(self, observed_leaf, **inputs):
+        """Exact probability mass at the observed coordinate leaf for both experts.
+
+        Survey coordinates need not equal any company coordinate. Scoring their
+        common finest H3 cell gives both experts the same observation space.
+        """
+        inputs = dict(inputs)
+        inputs['chain_state_vector'] = self._with_origin_accessibility(
+            inputs['chain_state_vector'], inputs['origin_x'], inputs['origin_y'])
+        self._set_accessibility_person(inputs['car_availability'], inputs['mobility_vector'])
+        static = self._get_cached_person_static(
+            inputs['person_id'], inputs['age'], inputs['income_class'],
+            inputs['daily_longest_distance_from_home'], inputs['daily_crowfly_total'],
+            inputs['daily_longest_distance_from_work'], inputs['activity_chain_vector'],
+            inputs['sex'], inputs['employed'], inputs['car_availability'], inputs['mobility_vector'])
+        dynamic = self._build_person_dynamic(
+            inputs['crowfly_consumed_before_trip'], inputs['trip_position_class'],
+            inputs['departure_time_normalized'], inputs['activity_duration_h'], 0.,
+            inputs['purpose'], inputs['origin_purpose'], chain_state_vector=inputs['chain_state_vector'])
+        person = np.concatenate([static, dynamic], axis=1)
+        self._current_origin_detour_index = int(self.detour_factor.get_cell_indices(inputs['origin_x'], inputs['origin_y'])[0])
+        self.s._current_origin_detour_index = self._current_origin_detour_index
+        geometry = {key: inputs[key] for key in ('home_x', 'home_y', 'work_x', 'work_y', 'origin_x', 'origin_y', 'has_work')}
+        purpose = inputs['purpose']
+        leaves, masses = self.s.predict_level2_short(
+            person, **geometry, purpose=purpose,
+            radius_m=self.short_trip_threshold_m + self.short_query_radius_m * 1.5,
+            expand_step_m=self.short_query_radius_m, min_candidates=self.short_min_candidates,
+            purpose_supported_mask=self.short_destination_support_masks[purpose], return_distribution=True,
+            candidate_weights=self._pt_weights("short", purpose))
+        short = float(masses[leaves.index(observed_leaf)]) if observed_leaf in leaves else 0.
+        parts = observed_leaf.split('/')
+        root, middle = parts[0], '/'.join(parts[:2])
+        probability = 1.
+        for wrapper, key, chosen in [(self.c, None, root), (self.m, root, middle), (self.d, (root, middle), observed_leaf)]:
+            if key is None:
+                children = wrapper.all_h3
+                attributes = None
+                candidate_static = wrapper.scaled_static_features_torch
+                distances = wrapper._build_candidate_dynamic(**geometry)
+                detour_indices = self._coarse_detour_indices
+                mask = require_purpose_mask(wrapper.mask, purpose)
+            else:
+                attribute_map = (wrapper.level1_candidate_attributes_by_level0 if wrapper is self.m
+                                 else wrapper.level2_candidate_attributes_by_level1)
+                attributes = attribute_map.get(key)
+                if attributes is None or chosen not in attributes['children']:
+                    return short, 0.
+                children = attributes['children']
+                candidate_static = attributes['scaled_static_features_torch']
+                distances = wrapper._build_candidate_dynamic(attributes, **geometry)
+                detour_indices = attributes['detour_cell_indices']
+                mask = require_purpose_mask(wrapper.mask[key], purpose)
+            if chosen not in children:
+                return short, 0.
+            distances = self._add_cached_detour_feature(distances, detour_indices,
+                                                       None if attributes is None else attributes['n_children'])
+            distances = transform_candidate_dynamic_matrix(distances, wrapper.candidate_dynamic_scaler)[None, :, :]
+            masses = predict_choice_proba(wrapper.model, person[:, :N_PERSON_STATIC], person[:, N_PERSON_STATIC:],
+                                         candidate_static, distances, mask,
+                                         candidate_weights=self._pt_weights(
+                                             "coarse" if key is None else "medium" if wrapper is self.m else "detailed",
+                                             purpose, key)).cpu().numpy()[0]
+            factor = float(masses[children.index(chosen)])
+            if factor == 0:
+                return short, 0.
+            probability *= factor
+        return short, probability
 
     @staticmethod
     def _reweight_by_distance(base_prob, xy, origin_x, origin_y, target_distance,
@@ -1234,53 +1414,13 @@ class HierarchicalLocationChoiceModel:
                     prob = self._reweight_by_distance(prob, xy, origin_x, origin_y, target_distance)
             return pool[int(rng.choice(len(pool), p=prob))]
 
-        purpose_index = self.destination_index.get(purpose)
-        purpose_prob = probabilities.get(purpose)
-        if purpose_index is not None:
-            pool = purpose_index.get(level2_h3)
-            if pool:
-                prob = purpose_prob.get(level2_h3)
-                xy_lookup = self.destination_index_xy.get(purpose) if self.destination_index_xy is not None else None
-                return _pick(pool, prob, xy_lookup, level2_h3)
-
-        purpose_fallback = self.destination_fallback.get(purpose)
-        if purpose_fallback is not None:
-            pool = purpose_fallback.get(level1_h3)
-            if pool:
-                prob = purpose_prob.get(level1_h3)
-                xy_lookup = self.destination_fallback_xy.get(purpose) if self.destination_fallback_xy is not None else None
-                return _pick(pool, prob, xy_lookup, level1_h3)
-
-        other_fallback = self.destination_fallback.get('other')
-        other_prob = probabilities.get('other')
-        other_xy_lookup = self.destination_fallback_xy.get('other') if self.destination_fallback_xy is not None else None
-        if other_fallback is not None:
-            pool = other_fallback.get(level1_h3)
-            if pool:
-                self.log(f"Using fallback pool for level1_h3 '{level1_h3}' and purpose '{purpose}' with {len(pool)} candidates", level=logging.WARNING)
-                prob = other_prob.get(level1_h3)
-                return _pick(pool, prob, other_xy_lookup, level1_h3)
-
-        # All local fallbacks exhausted — widen to sibling level1 cells (O(1) parent lookup, pre-built at init).
-        sibling_l1s = self.l1_siblings.get(level1_h3)
-        if sibling_l1s:
-            for i in rng.permutation(len(sibling_l1s)):
-                sib_l1 = sibling_l1s[i]
-                if purpose_fallback is not None:
-                    pool = purpose_fallback.get(sib_l1)
-                    if pool:
-                        prob = purpose_prob.get(sib_l1)
-                        xy_lookup = self.destination_fallback_xy.get(purpose) if self.destination_fallback_xy is not None else None
-                        self.log(f"Widened to sibling level1 '{sib_l1}' for purpose '{purpose}' (original level1 '{level1_h3}' had no destinations)", level=logging.WARNING)
-                        return _pick(pool, prob, xy_lookup, sib_l1)
-                if other_fallback is not None:
-                    pool = other_fallback.get(sib_l1)
-                    if pool:
-                        prob = other_prob.get(sib_l1)
-                        self.log(f"Widened to sibling level1 '{sib_l1}' (other fallback) for purpose '{purpose}' (original level1 '{level1_h3}' had no destinations)", level=logging.WARNING)
-                        return _pick(pool, prob, other_xy_lookup, sib_l1)
-
-        raise RuntimeError(
-            f"No candidates in destination pool for purpose '{purpose}', "
-            f"level1_h3 '{level1_h3}', level2_h3 '{level2_h3}'"
-        )
+        purpose = base_activity_purpose(purpose)
+        pool = self.destination_index.get(purpose, {}).get(level2_h3)
+        if not pool:
+            raise RuntimeError(
+                f"Destination mask/pool mismatch for purpose {purpose!r}, leaf {level2_h3!r}: "
+                "no eligible facility in the selected cell"
+            )
+        prob = probabilities[purpose][level2_h3]
+        xy_lookup = self.destination_index_xy[purpose]
+        return _pick(pool, prob, xy_lookup, level2_h3)

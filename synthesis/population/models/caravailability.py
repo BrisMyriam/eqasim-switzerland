@@ -4,6 +4,8 @@ from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassif
 from catboost import CatBoostClassifier
 import logging
 
+from data.utils import binary_code_series
+
 logger = logging.getLogger("synpp")
 
 CANONICAL_CODE_DTYPES = {
@@ -56,6 +58,7 @@ def _to_dl_has(series):
 
 
 def configure(context):
+    context.config("random_seed")
     # Survey:
     context.stage("data.microcensus.21.persons")
     context.stage("data.microcensus.21.household_persons")
@@ -65,11 +68,19 @@ def configure(context):
 
 
 def execute(context):
+    from synthesis.population.models.non_private import execute_without_home_only
+    result = execute_without_home_only(context, "synthesis.population.models.carownership", _execute_model,
+                                     {"car_availability": 0})
+    result["car_availability"] = binary_code_series(result["car_availability"])
+    return result
+
+
+def _execute_model(context):
     # -------------------------------------------------------------------
     # CONFIG
     # -------------------------------------------------------------------
     CA_MODEL = "catboost"   # "rf" or "gbm" or "catboost"
-    SEED_CA  = 2026
+    SEED_CA = int(context.config("random_seed"))
     DIAG_CANTON_ID = "25"
     USE_DRAW = True  # diagnostics compare on draw vs hat
 
@@ -326,14 +337,14 @@ def execute(context):
                 learning_rate=0.05,
                 max_iter=400,
                 min_samples_leaf=50,
-                random_state=42
+                random_state=SEED_CA
             )
         elif mt == "rf":
             return RandomForestClassifier(
                 n_estimators=600,
                 max_depth=None,
                 min_samples_leaf=5,
-                random_state=42,
+                random_state=SEED_CA,
                 n_jobs=-1
             )
         elif mt in ("catboost", "cat"):
@@ -343,7 +354,7 @@ def execute(context):
                 learning_rate=0.03,
                 depth=10,
                 l2_leaf_reg=6.0,
-                random_seed=42,
+                random_seed=SEED_CA,
                 verbose=False,
                 bootstrap_type="Bernoulli",
                 subsample=0.8
@@ -597,4 +608,5 @@ def execute(context):
                 f"caravailability output column {column!r} cannot be converted to {dtype}"
             ) from error
 
+    pop_df["car_availability"] = binary_code_series(pop_df["car_availability"])
     return pop_df

@@ -3,7 +3,7 @@ from typing import Optional, Union, List
 import numpy as np
 import logging
 import os
-import glob
+from matsim.config.tools import glob_output_files
 
 from ..paths import configure_simulation_path, get_simulation_path
 
@@ -19,8 +19,8 @@ def execute(context):
     iterations_directory = os.path.join(simulation_path, "ITERS")
     
     # searching for link stats file 
-    linkstats_file = glob.glob(os.path.join(iterations_directory, "it.*", f"*.linkstats.txt.gz"))
-    counts_file = glob.glob(os.path.join(iterations_directory, "it.*", f"*.traffic_flow_daily_counts.csv"))
+    linkstats_file = glob_output_files(os.path.join(iterations_directory, "it.*", "*.linkstats.txt"))
+    counts_file = glob_output_files(os.path.join(iterations_directory, "it.*", "*.traffic_flow_daily_counts.csv"))
     files = counts_file if counts_file else linkstats_file
 
     if not files:
@@ -38,7 +38,7 @@ def execute(context):
             combined_df = pd.concat(dfs).groupby("linkId", as_index=False).mean()            
             
             # Save the averaged data to a temporary file for comparison
-            temp_file = files[-1].replace(".csv", "_averagedOverLast10Iterations.csv")
+            temp_file = os.path.join(context.path(), "traffic_flow_daily_counts_averaged.csv")
             combined_df.to_csv(temp_file, index=False, sep=";")
             logger.info(f"Averaged counts file saved to {temp_file}")
             file = temp_file
@@ -123,13 +123,13 @@ class Compare:
         )
     
         # Get unique simulation links for filtering
-        all_links = network.get_in_simulation_links(matched.link_id.unique())
+        all_links = matched.link_id.unique()
         assert all(pd.notna(all_links)), "Not all links are found in the network"
         df_sim = df_sim[df_sim.link_id.isin(all_links)]
     
-        # Expand matched with real simulation links
+        # Match IDs already refer to simulated links.
         _matched = matched.copy()
-        _matched['sim_link'] = network.get_in_simulation_links(_matched['link_id'])
+        _matched['sim_link'] = _matched['link_id']
     
         # Merge simulated flow values
         df_sim = df_sim[['link_id', 'flow']].rename(columns={'link_id': 'sim_link', 'flow': 'sim_flow'})

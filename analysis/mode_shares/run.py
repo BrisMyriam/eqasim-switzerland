@@ -28,6 +28,7 @@ plt.rcParams.update(
 
 
 def configure(context):
+    context.stage("analysis.mode_shares.trip_distributions")
     context.stage("analysis.mode_shares.target")
     context.stage("analysis.mode_shares.simulated")
     context.stage("data.spatial.cantons")
@@ -36,7 +37,7 @@ def configure(context):
     context.config("analysis.counts.simulation_path", default="")
     context.config("output_path")
     context.config("output_id")
-    context.config("simulation_directory", default = "simulation_output")
+    context.config("simulation_directory", default = 'simulation_output')
 
 
 def execute(context):

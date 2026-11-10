@@ -16,7 +16,7 @@ def configure(context):
     context.stage("data.spatial.cantons")
     context.stage("data.spatial.swiss_border")
 
-    context.config("include_external_population", default=False)
+    context.config("include_external_population", default=True)
     if context.config("include_external_population"):
         context.stage("data.external_population.hts_trips.trips")
         context.stage("data.external_population.constants")
@@ -192,6 +192,7 @@ def execute(context):
     global_modal_shares.to_csv(global_shares_output_path, index=False)
 
     # Save cantonal modal shares
+    cantonal_modal_shares.index.name = "canton_name"
     cantonal_modal_shares.to_csv(cantonal_shares_output_path, index=True)
 
     return global_shares_output_path, cantonal_shares_output_path

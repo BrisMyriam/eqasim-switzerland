@@ -9,12 +9,16 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from shapely.geometry import LineString
+from shapely.ops import nearest_points
 
 from ..matching.counts import Counts
 from ..matching.matcher import TrafficDataMatcher
 from ..matching.plots import Plotter
 from ..matching.results import save_count_results
-from ..paths import configure_simulation_path, get_analysis_output_path, matches_found
+from ..matching.detailed_statistics import read_detailed_statistics, point_details
+from ..construction_sites import configure_filter, filter_counts, annotate_counts
+from ..paths import configure_simulation_path, get_simulation_path, get_analysis_output_path, matches_found
 
 
 logger = logging.getLogger("synpp")
@@ -34,12 +38,13 @@ ROAD_TYPES_TO_SHOW = [
 
 
 def configure(context):
+    configure_filter(context, for_map=True)
     context.stage("analysis.counts.cantons.transcality")
     context.stage("analysis.counts.matching.network")
     context.stage("analysis.counts.matching.compare")
     context.stage("data.spatial.swiss_border")
     context.config("input_downsampling")
-    context.config("only_weekday", default=False)
+    context.config("only_weekday", default=True)
     configure_simulation_path(context)
 
 
@@ -73,12 +78,15 @@ def execute(context, *, counts_stage="analysis.counts.cantons.transcality",
     )
     network = context.stage("analysis.counts.matching.network")
     matched = TrafficDataMatcher().match(network=network, counts=counts, mode="directional")
+    counts = annotate_counts(context, counts, matched, network, city)
     if not matches_found(matched, city):
         return None
 
-    # Group on the active simulation link, including its detailed replicates.
-    audit = matched[["id", "link_id", "distance"]].copy()
-    audit["simulation_link_id"] = network.get_in_simulation_links(audit["link_id"])
+    # Record the actual simulation link matched to each detector.
+    audit = matched[["id", "link_id", "distance", *[
+        column for column in ("match_method", "angle_difference", "reference_distance") if column in matched
+    ]]].copy()
+    audit["simulation_link_id"] = audit["link_id"]
     audit.merge(
         counts.counts.drop(columns="geometry"), on="id", validate="one_to_one"
     ).to_csv(os.path.join(context.path(), "detector_matches.csv"), index=False)
@@ -105,6 +113,8 @@ def execute(context, *, counts_stage="analysis.counts.cantons.transcality",
         "profile_json",
         "station_ids",
         "detector_count",
+        "construction_affected",
+        "construction_reason",
     ]
     flows = flows.merge(counts.counts[metadata_columns], on="id", how="left")
     flows["period_hours"] = period_hours
@@ -119,20 +129,13 @@ def execute(context, *, counts_stage="analysis.counts.cantons.transcality",
         default="Within bounds",
     )
 
+    save_map(context, counts, flows, network, comparison, sample_size, output_directory, city, peak_hours, period, flow_unit)
+    counts, matched = filter_counts(context, counts, matched, network, city)
+    flows = flows[flows.id.isin(counts.counts.id)].copy()
+    if not matches_found(flows, city, source="construction-filtered observations"):
+        return None
+
     plotter = Plotter()
-    plotter.plot_network_with_counts(
-        counts,
-        matched,
-        network,
-        output=os.path.join(output_directory, f"{city}_network.png"),
-        lw=0.7,
-        markersize=4,
-        figsize=(40, 40),
-        road_types="all",
-        cut=True,
-        highlight_stations=[],
-        return_matched_links=False,
-    )
 
     result_path = save_count_results(city, matched, flows, context.path())
     plotter.plot_flow(
@@ -181,6 +184,11 @@ def execute(context, *, counts_stage="analysis.counts.cantons.transcality",
         flow_unit=flow_unit,
     )
 
+    return result_path
+
+
+def save_map(context, counts, flows, network, comparison, sample_size, output_directory,
+             city, peak_hours, period, flow_unit):
     points = Plotter.prepare_flow_map_points(counts.counts, flows).merge(
         flows[
             [
@@ -196,7 +204,23 @@ def execute(context, *, counts_stage="analysis.counts.cantons.transcality",
         on="id",
         how="left",
     )
-    points["daily_profile"] = points["profile_json"].map(Plotter.flow_profile_svg)
+    # Enrich only Transcality HTML; comparison metrics and calibration stay unchanged.
+
+    detailed = read_detailed_statistics(
+        get_simulation_path(context),
+        [link_id for ids in points.matched_link_ids for link_id in ids],
+    )
+    tooltip_fields = list(Plotter.TRANSCALITY_FLOW_MAP_TOOLTIP_FIELDS)
+    profiles = []
+    for index, row in points.iterrows():
+        details, simulated_profile = point_details(row.matched_link_ids, detailed, sample_size, peak_hours)
+        for field, value in details.items():
+            points.loc[index, field] = value
+            if field not in tooltip_fields:
+                tooltip_fields.insert(-1, field)
+        profiles.append(Plotter.flow_profile_svg(row.profile_json, simulated_profile))
+    points["daily_profile"] = profiles
+    points = add_match_geometry(points, network)
     points = gpd.GeoDataFrame(points, geometry="geometry", crs=counts.counts.crs).to_crs(
         epsg=4326
     )
@@ -217,14 +241,35 @@ def execute(context, *, counts_stage="analysis.counts.cantons.transcality",
         colored_links.to_crs(epsg=4326),
         data_to_show=["link_id", "simulated_flow"] + (["flow_period"] if peak_hours is not None else []),
         point_gdf=[points],
-        point_data_to_show=Plotter.TRANSCALITY_FLOW_MAP_TOOLTIP_FIELDS,
+        point_data_to_show=tooltip_fields,
         border=border,
         cut_network=True,
         path_color_column="_flow_color",
         path_color_legend=legend,
+        show_construction=not context.config("analysis.counts.exclude_construction_sites"),
         path_to_save=os.path.join(output_directory, f"counts_on_network_{city}.html"),
     )
-    return result_path
+
+
+def add_match_geometry(points, network):
+    """Keep directed link curves and metric-nearest connectors for map selection."""
+    metric_points = points.to_crs(2056)
+    ids = {str(link) for links in points.matched_link_ids for link in links}
+    roads = network.get_link_geometries(list(ids)).to_crs(2056).set_index("link_id")
+    roads.index = roads.index.astype(str)
+    paths, connectors = [], []
+    for _, row in metric_points.iterrows():
+        shapes = [roads.loc[str(link), "geometry"] for link in dict.fromkeys(row.matched_link_ids)
+                  if str(link) in roads.index]
+        lines = [LineString([row.geometry, nearest_points(row.geometry, shape)[1]]) for shape in shapes]
+        paths.append([path for shape in gpd.GeoSeries(shapes, crs=2056).to_crs(4326)
+                      for path in Plotter.extract_paths(shape)])
+        connectors.append([path for shape in gpd.GeoSeries(lines, crs=2056).to_crs(4326)
+                           for path in Plotter.extract_paths(shape)])
+    result = points.copy()
+    result["_matched_paths"] = paths
+    result["_connector_paths"] = connectors
+    return result
 
 
 def closest_counts_within_bounds(flows):
@@ -246,8 +291,6 @@ def closest_counts_within_bounds(flows):
 def prepare_flow_colored_links(network, link_stats, sample_size, road_types):
     """Attach full-scale simulated flows and viridis colors to real link shapes."""
     roads = network.get_ways(road_types=road_types).copy()
-    roads["geometry_link_id"] = roads["link_id"].astype(str)
-    roads["link_id"] = network.get_in_simulation_links(roads["geometry_link_id"])
     roads = roads.dropna(subset=["link_id"])
     roads["link_id"] = roads["link_id"].astype(str)
 
@@ -292,9 +335,7 @@ def aggregate_counts_by_link(counts, matched, network):
     observations = matched.merge(
         counts.counts.drop(columns="geometry"), on="id", validate="one_to_one"
     )
-    observations["simulation_link_id"] = network.get_in_simulation_links(
-        observations["link_id"]
-    )
+    observations["simulation_link_id"] = observations["link_id"]
     if observations["simulation_link_id"].isna().any():
         raise ValueError("A Transcality match has no corresponding simulation link.")
 
@@ -313,10 +354,12 @@ def aggregate_counts_by_link(counts, matched, network):
             "detector_ids": ", ".join(group["detector_ids"].astype(str)),
             "station_ids": group["id"].tolist(),
             "detector_count": len(group),
+            "construction_affected": bool(group.get("construction_affected", pd.Series(False, index=group.index)).any()),
+            "construction_reason": ", ".join(sorted(set(group.get("construction_reason", pd.Series(dtype=str)).dropna()) - {""})),
             "profile_json": profile,
         })
         # Retain a representative detailed segment for geometry/road metadata;
-        # Compare resolves it to the simulation link once, not once per detector.
+        # Keep one match per simulation link after combining detector counts.
         matches.append({
             "id": observation_id,
             "geometry": first["geometry"],

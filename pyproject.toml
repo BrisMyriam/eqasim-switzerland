@@ -55,6 +55,8 @@ dependencies = [
     "xlwt>=1.3.0",
     "zstandard>=0.25.0",
     "folium",
+    "gtfs-kit",
+    "opening-hours-py>=2.1.4,<3",
 ]
 
 [tool.uv]
@@ -63,6 +65,7 @@ dependencies = [
 override-dependencies = ["pandas>=3.0.2"]
 
 [tool.uv.sources]
+synpp = { git = "https://github.com/matsim-eth/synpp.git", rev = "e747ebc5ba928164e92ef94eb4ca18693da1dc8a" }
 torch = { index = "pytorch-cpu" }
 
 [[tool.uv.index]]

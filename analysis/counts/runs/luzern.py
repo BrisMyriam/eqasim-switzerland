@@ -13,7 +13,7 @@ def configure(context):
     
     context.config("input_downsampling")
     configure_simulation_path(context)
-    context.config("only_weekday", default=False)
+    context.config("only_weekday", default=True)
 
 def execute(context):   
     if context.config("only_weekday"):
@@ -60,15 +60,6 @@ def execute(context):
 
     # Plot the network and highligh these links in green  
     plotter = Plotter()
-    plotter.plot_network_with_counts( 
-                                    counts, matched, network,
-                                    output=os.path.join(path_to_images, f"{city}_network.png"),
-                                    lw = 0.7,
-                                    markersize = 4, 
-                                    figsize = (40,40),                                                    
-                                    road_types = "all",
-                                    cut = True,
-                                    highlight_stations = stations_to_drop)
 
     # filter out stations to drop and save results
     flows = flows[~flows['id'].isin(stations_to_drop)].reset_index(drop=True)

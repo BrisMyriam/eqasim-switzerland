@@ -14,6 +14,9 @@ from .feature_encoding import CANDIDATE_FEATURES, N_CANDIDATE_DYNAMIC, ACTIVITY_
 from .choice_model import NeuralChoiceModel, train_choice_model
 from .model_wrappers import LocalChoiceWrapper
 
+from .tools import model_validation_options, training_mobility, enrich_candidate_tensor, attach_candidate_features
+from .training_split import expert_persons
+
 logger = logging.getLogger("synpp: local_model")
 
 MODEL_NAME = "local_model.pt"
@@ -24,16 +27,31 @@ COUNT_ZOOM_AREAS = {
 
 
 def configure(context):
+    context.config("secondary_nn_model_validation_rotation_epochs", 3)
+    context.config("secondary_nn_model_validation_holdout_fraction", 0.1)
+    context.stage("synthesis.population.spatial.secondary_nn.mobility")
+    context.config("secondary_nn_use_target_distance", True)
+    context.config("secondary_nn_model_validation_folds", 5)
+    context.config("secondary_nn_model_min_epochs", 30)
+    context.config("secondary_nn_model_validation_strategy", "rotating_holdout")
+    context.stage("data.spatial.ovgk")
+    context.config("secondary_nn_distance_loss_kind", "crps_energy")
+    context.config("secondary_nn_distribution_loss_weight", 0.1)
+    context.config("secondary_nn_distribution_scale_m", 1000.0)
+    context.config("secondary_nn_energy_projections", 8)
+    if not context.config("secondary_nn_use_target_distance"):
+        context.config("secondary_nn_crossfit_fold", -1)
+        context.stage("synthesis.population.spatial.secondary_nn.training_split")
     context.stage("synthesis.population.spatial.secondary_nn.h3")
     context.stage("synthesis.population.spatial.secondary.detour_factors.factors")
     context.stage("synthesis.population.spatial.secondary_nn.mz_chains")
-    context.stage("data.microcensus.trips")
+    context.stage("data.microcensus.secondary_trips")
     context.stage("data.microcensus.persons")
     context.stage("data.constants")
     context.stage("data.spatial.swiss_border")
     context.stage("synthesis.population.spatial.secondary_nn.regional_model")
 
-    context.config("threads")
+    context.config("threads", volatile=True)
     context.config("random_seed")
 
     # training params
@@ -43,7 +61,7 @@ def configure(context):
     context.config("local_model_learning_rate", 4e-3)
     context.config("local_model_dropout_rate", 0.30)
     context.config("local_model_weight_decay", 1e-2)
-    context.config("local_model_validation_folds", 5)
+    context.config("local_model_validation_folds", None)
     context.config("local_model_validation_every", 2)
     context.config("local_model_early_stopping_patience", 5)
     context.config("local_model_early_stopping_min_delta", 1e-3)
@@ -52,10 +70,13 @@ def configure(context):
 
 
 def execute(context):
+
+    # Load expert inputs and prepare the fitting data.
+
     logger.info("Training local model (neural choice) for level2-within-level1 secondary location choice...")
 
     overwrite_model = context.config("overwrite_local_model_if_exists")
-    model_path = os.path.join(context.working_directory, MODEL_NAME)
+    model_path = os.path.join(context.path(), MODEL_NAME)
     if os.path.exists(model_path) and not overwrite_model:
         logger.info("Model %s already exists.", MODEL_NAME)
         return (model_path,)
@@ -64,15 +85,18 @@ def execute(context):
     mz_persons = context.stage("data.microcensus.persons")[[
         "person_id", "age", "sex", "car_availability", "employed", "income_class", "home_x", "home_y", "work_x", "work_y", "weekend", "person_weight"
     ]]
+    mz_persons = expert_persons(context, mz_persons)
     constants = context.stage("data.constants")
     mz_persons["car_availability"] = (mz_persons["car_availability"] != constants.CAR_AVAILABILITY_NEVER)
 
-    mz_trips, _, _, _ = context.stage("data.microcensus.trips")
-    mz_trips = mz_trips[["person_id", "trip_id", "origin_x", "origin_y", "purpose", "origin_purpose"]]
+    # Preserve nonstudent education recoding in the filtered NN training pool.
+    mz_trips = context.stage("data.microcensus.secondary_trips")
+    mz_trips = mz_trips.loc[mz_trips.person_id.isin(mz_persons.person_id)].copy()
+    mz_trips = mz_trips[["person_id", "trip_id", "origin_x", "origin_y", "destination_x", "destination_y", "purpose", "origin_purpose"]]
     mz_chain_trips = context.stage("synthesis.population.spatial.secondary_nn.mz_chains")[[
         "person_id", "trip_id", "daily_longest_distance_from_home", "daily_crowfly_total", "crowfly_consumed_before_trip", "trip_position_class",
         "departure_time_normalized", "daily_longest_distance_from_work",
-        "activity_duration_h", "target_distance", "trip_destination_distance_from_home", "activity_chain"
+        "activity_duration_h", "target_distance", "trip_destination_distance_from_home", "activity_chain", "chain_state"
     ]]
     mz_trips = mz_trips.merge(mz_chain_trips, on=["person_id", "trip_id"], how="left")
 
@@ -128,6 +152,8 @@ def execute(context):
                                                     urban_core_count_l2, urban_count_l2, education_count_l2, shop_count_l2, leisure_count_l2, sport_count_l2, gastronomy_count_l2,
                                                     accommodation_count_l2, cultural_count_l2, ovgk_share_a_by_l2, ovgk_share_b_by_l2,
                                                     ovgk_share_c_by_l2, ovgk_share_d_by_l2, ovgk_share_none_by_l2, outside_fraction_by_l2)
+
+    attach_candidate_features(level2_candidate_attributes_by_level1, h3_geo_level2)
 
     logger.info("\t Preparing microcensus training set...")
     df = mz_trips.merge(trips_h3, on=["person_id", "trip_id"], how="left")
@@ -249,12 +275,16 @@ def execute(context):
     ########### Building tensors and fitting scalers ###########
     purpose_categories = [str(purpose) for purpose in SECONDARY_ACTIVITIES]
     person_trip_matrix, static_matrix, dynamic_matrix, person_static_scaler, person_dynamic_scaler, person_trip_cols = fit_person_trip_matrix(
+        mobility_matrix=training_mobility(context, df),
         age=age, sex=sex, employed=employed, car_availability=car_availability, income_class=income_class,
         daily_longest=daily_longest, daily_total=daily_total, daily_longest_work=daily_longest_work,
         activity_chain_matrix=activity_chain_matrix,
         consumed_before=consumed_before, trip_position=trip_position, departure_time=departure_time,
         activity_duration_h=activity_duration_h, target_distance=target_distance,
         purpose_series=df["purpose"], origin_purpose_series=df["origin_purpose"],
+        use_target_distance=bool(context.config("secondary_nn_use_target_distance")),
+        chain_state_matrix=np.stack(df["chain_state"]),
+        random_state=int(context.config("random_seed")),
         purpose_categories=purpose_categories,
         person_static_scaler=person_static_scaler, person_dynamic_scaler=person_dynamic_scaler)
 
@@ -267,9 +297,10 @@ def execute(context):
         candidate_tensor, origin_x, origin_y, cand_x, cand_y, valid_mask,
         context.stage("synthesis.population.spatial.secondary.detour_factors.factors"),
     )
+    candidate_tensor = enrich_candidate_tensor(candidate_tensor, cand_x, cand_y, valid_mask, h3_geo_level2)
     candidate_dist_home_m = candidate_tensor[:, :, 0].astype(np.float32)
     candidate_dist_last_m = candidate_tensor[:, :, 2].astype(np.float32)
-    candidate_tensor, candidate_static_scaler, candidate_dynamic_scaler = fit_candidate_tensor(candidate_tensor, valid_mask)
+    candidate_tensor, candidate_static_scaler, candidate_dynamic_scaler = fit_candidate_tensor(candidate_tensor, valid_mask, random_state=int(context.config("random_seed")))
 
     ############ Training the model ###########
     logger.info("\t Training local neural choice model...")
@@ -287,7 +318,16 @@ def execute(context):
         hidden_dim=32,
         dropout_rate=float(context.config("local_model_dropout_rate")),
     )
-    train_choice_model(model=model, person_static_x=static_matrix, person_dynamic_x=dynamic_matrix, candidate_static_x=candidate_static_x, candidate_dynamic_x=candidate_dynamic_x,
+
+    # Select the destination distribution loss.
+
+    loss_kind = context.config("secondary_nn_distance_loss_kind")
+    train_choice_model(
+        model=model,
+        person_static_x=static_matrix,
+        person_dynamic_x=dynamic_matrix,
+        candidate_static_x=candidate_static_x,
+        candidate_dynamic_x=candidate_dynamic_x,
         y=y, valid_mask=valid_mask, logger_instance=logger, weights=weights,
         epochs=int(context.config("local_model_epochs")),
         batch_size=int(context.config("local_model_batch_size")),
@@ -295,8 +335,8 @@ def execute(context):
         weight_decay=float(context.config("local_model_weight_decay")),
         num_threads=int(context.config("threads")),
         path=context.path(),
-        n_val_folds=int(context.config("local_model_validation_folds")),
-        val_every=int(context.config("local_model_validation_every")),
+        **model_validation_options(context, folds=context.config("local_model_validation_folds"),
+                                   val_every=context.config("local_model_validation_every")),
         validation_groups=df["person_id"].to_numpy(),
         rotate_validation=False,
         early_stopping_patience=int(context.config("local_model_early_stopping_patience")),
@@ -306,7 +346,15 @@ def execute(context):
         distance_targets=target_distance.astype(np.float32),
         distance_candidates_home=candidate_dist_home_m,
         distance_targets_home=target_home_distance.astype(np.float32),
-        distance_loss_weight=float(context.config("secondary_nn_distance_loss_weight")),
+        distance_loss_weight=float(context.config(
+            "secondary_nn_distribution_loss_weight" if loss_kind == "crps_energy"
+            else "secondary_nn_distance_loss_weight")),
+        distance_loss_kind=loss_kind,
+        distribution_scale_m=float(context.config("secondary_nn_distribution_scale_m")),
+        energy_projections=int(context.config("secondary_nn_energy_projections")),
+        candidate_xy=np.stack([cand_x, cand_y], axis=-1) if loss_kind == "crps_energy" else None,
+        observed_xy=df[["destination_x", "destination_y"]].to_numpy(dtype=np.float32, copy=True)
+            if loss_kind == "crps_energy" else None,
         distance_loss_short_floor_m=float(context.config("secondary_nn_distance_loss_short_floor_m")))
 
     ########## Building wrapper and saving model ##########
@@ -317,8 +365,9 @@ def execute(context):
     wrapper.save(model_path)
 
     ########### Plotting analysis of predictions ##########
-    _ = plot_analysis(context=context, wrapper=wrapper, person_trip_matrix=person_trip_matrix, candidate_tensor=candidate_tensor, valid_mask=valid_mask, df=df,
-                      children_by_level1=children_by_level1, h3_geo_level2=h3_geo_level2, centroid_x_by_l2=centroid_x_by_l2, centroid_y_by_l2=centroid_y_by_l2)
+    if context.config("secondary_nn_use_target_distance") or int(context.config("secondary_nn_crossfit_fold")) < 0:
+        _ = plot_analysis(context=context, wrapper=wrapper, person_trip_matrix=person_trip_matrix, candidate_tensor=candidate_tensor, valid_mask=valid_mask, df=df,
+                          children_by_level1=children_by_level1, h3_geo_level2=h3_geo_level2, centroid_x_by_l2=centroid_x_by_l2, centroid_y_by_l2=centroid_y_by_l2)
 
     logger.info("Detailed model saved to %s", model_path)
     return (model_path,)

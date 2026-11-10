@@ -19,11 +19,11 @@ MAX_DISTANCE_M = 50000.0
 
 def configure(context):
     context.stage("data.microcensus.persons")
-    context.stage("data.microcensus.trips")
+    context.stage("data.microcensus.secondary_trips")
     context.stage("data.spatial.ovgk")
     context.stage("data.statent.density")
 
-    context.config("threads")
+    context.config("threads", volatile=True)
     context.config("locations_v2_analysis_max_points", 250000)
     context.config("locations_v2_analysis_density_radius", 250.0)
 
@@ -160,7 +160,8 @@ def _impute_statent_density_for_points(context, df, x_col, y_col):
 
 def _prepare_microcensus(context):
     persons = context.stage("data.microcensus.persons").copy()
-    trips = context.stage("data.microcensus.trips")[0].copy()
+    # Inspect the same derived diary purposes used by secondary assignment.
+    trips = context.stage("data.microcensus.secondary_trips").copy()
 
     trips = _attach_trip_context(trips)
 

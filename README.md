@@ -1,7 +1,13 @@
-This repository contains the documentation and the code used to create the
-Switzerland synthetic population and corresponding travel. It also provides stages that can be used to convert it and run a MATSim/eqasim agent-based simulations. Furthermore, it provides a visualization of the data at the end of the pipeline.
+# eqasim Switzerland
 
-The pipeline uses the `synpp` Python package for stage chaining avaialble at [here](https://github.com/eqasim-org/synpp).
+This repository generates Switzerland's synthetic population and daily travel,
+builds MATSim/eqasim scenarios, runs transport simulations, and analyzes the results.
+The pipeline uses [Synpp](https://github.com/eqasim-org/synpp) to organize its stages.
+
+See the [documentation index](doc/INDEX.md) for module guides and changelogs.
+
+For education reference provenance, annual BFS updates and STATENT consistency
+checks, see [Maintaining education reference files](doc/analysis/education_reference_update.md).
 
 ## Main reference
 
@@ -12,7 +18,9 @@ The main research reference for the synthetic population of Switzerland is:
 
 ## Preparing the environment
 
-We use `uv` for dependency management. Make sure that you can call `uv` from your working environment. You can set up all dependencies by calling:
+Use Python 3.13 or newer and `uv` for dependency management. MATSim requires a
+Java 25 JDK; building eqasim from source also requires Maven 3.x and access to its
+dependency repositories. Install the Python dependencies from the repository root:
 
 ```bash
 cd /project/code
@@ -21,7 +29,19 @@ uv sync
 
 In particular, the dependencies contain the [synpp](https://github.com/eqasim-org/synpp) package, which is the computational backbone of the pipeline.
 
+`pyproject.toml` and `uv.lock` pin Synpp to commit
+[`638adc5`](https://github.com/Dib-AEK/synpp/commit/638adc5ea847eef97a8637c8620ea636b436ae8a)
+of [Dib-AEK/synpp](https://github.com/Dib-AEK/synpp/tree/fix/shared-dependency-traversal),
+based on v1.7.3. The fork resolves shared dependencies once per stage, avoiding
+the repeated traversal that stalled mode-choice initialization. `uv sync` installs
+the corrected package directly; no local package patch is needed.
+
 ## Executing the pipeline
+
+The beginner [configuration template](config.yml) contains the main inputs and
+scenario choices, each with a short comment. Advanced defaults are declared
+directly in each stage. Explicit YAML values override these defaults.
+
 
 To run the pipeline, go to the project directory and call the `synpp` execution script:
 
@@ -30,7 +50,13 @@ cd /project/code
 uv run -m synpp config.yml
 ```
 
-It will read the configuration file, run the processing pipeline, and eventually create the synthetic population inside the output directory.
+Fill in the template's paths and input filenames before running it. The selected
+`run` stages determine whether population synthesis, simulation, or analysis is
+executed. The working cluster configuration is run with
+`uv run -m synpp config_dib_10.yml`; private configurations are not included in Git.
+On the cluster, Maven needs explicit proxy settings. The local launchers enable
+these with `MAVEN_USE_ENV_PROXY=true` after loading `eth_proxy`. Alternatively,
+set `eqasim_path` to an existing, valid eqasim JAR.
 
 ## Generating pipeline flowchart
 
@@ -52,14 +78,16 @@ Type `python3 visualize_pipeline.py -h` for further explanations.
 
 ## Output
 
-To create a full scenario, add the `matsim.simulation.run` stage to the config file. The
-configuration option `output_path` must be set. The option
-`output_path` must point to an existing directory, where results of the pipeline
-will be saved. 
+Use `matsim.output` in the configuration's `run` list to build, simulate and
+export a complete scenario to `<output_path>/<output_id>`. Set `output_path` to
+your export folder. Scenario inputs and simulation results are copied there;
+the upstream caches remain available. `matsim.simulation.run` alone runs the
+prepared scenario without exporting it. Use `synthesis.output` to export the
+synthetic population separately.
 
 # Setting up and running on Windows
 
-We recommend to run the pipeline on a Linux server, mainly because for large scenarios around 100GB of memory are needed. However, it is possible to run the pipeline locally on a Windows machine. The whole pipeline can run in a Virtual Machine (VM). The procedure would be as follows:
+We recommend running the pipeline on a Linux server because full-country scenarios can require substantial memory. However, it is possible to run the pipeline locally on a Windows machine. The whole pipeline can run in a Virtual Machine (VM). The procedure would be as follows:
 
 - Install VirtualBox
 - Install a lightweight Linux system in the VM, for instance Ubuntu Server
@@ -81,7 +109,7 @@ The raw data that is used in the process can be found on our server
 
 **Microcensus Transport and Mobility**
 - Content: `microcensus/` contains the Mikrozensus Verkehr und Mobilität in CSV
-format with 60'000 daily trips of Swiss residents.
+format describing Swiss residents' daily travel.
 - The following files should be placed in the `microcensus/` directory: `etappen.csv`, `haushalte.csv`, `haushaltspersonen.csv`, `wege.csv`, `zielpersonen.csv`
 - Year: 2015, 2021
 - Contract: BfS
@@ -201,16 +229,35 @@ classifications for all municipalities on 01.01.2024
     - Contract: Open data available in the `opendata` folder in this repository.
 
 **Projections are used currently only for the population and not freight; need an update to the code**
+
+Population and household scaling use unchanged official BFS CSV exports under
+`projections/raw/`. Download them explicitly into a new directory:
+
+```bash
+uv run python -m data.statpop.projections.download \
+  --output-path /path/to/data/projections/raw
+```
+
+The downloader archives the original response bytes, queries, metadata and
+checksums. Normal pipeline runs work offline: `data.statpop.projections.raw`
+reads these exports and writes normalized tables into its cache. These inputs
+are required only when `enable_scaling: true`. Share the entire raw directory;
+the previous prepared `households_2025.csv` and `population_year_end_2025.csv`
+files are no longer used. See the [raw projection guide](doc/data/statpop/projections.md)
+for source details and update instructions.
+
 - Households:
-    - Content: `projections/households` should contain data for number of households per canton from 2020-2050 (unfortunately it is no lonegr avaialble to download household size distribution per canton). All projections are according to the BfS reference scenario.
-    - Download the `xlsx` file and place it in the `projections/households` folder
-    - State: 2024
+    - Content: `projections/raw/DF_SCEN_MENAGES.csv` is the original UTF-8 SDMX CSV response for BFS reference scenario **AM-00-2025**, covering household projections for 2025–2055.
+    - The processing stage selects `SCENARIO=AM-00-2025`, `SIZE_HOUSEHOLD=_T`, `NUMBER_HOUSEHOLD_PERSON=MEN`, `FREQ=A`, `TIME_HORIZ=P`, and `scaling_year`. The raw export retains national totals and person counts; only private-household counts for the 26 cantons become household controls. The old AM-00-2020 workbook is no longer used.
+    - Recovered residents' synthetic singleton households are excluded from this private-household margin. They remain in the total-person controls and in household replication after fitting.
+    - State: 2025
     - Contract:
-        - Projections: [Open Data](https://www.bfs.admin.ch/bfs/de/home/statistiken/katalog.assetdetail.16344851.html)
+        - Projections: [Open Data](https://www.bfs.admin.ch/asset/en/DF_SCEN_MENAGES)
 - Population:
-    - Content: `projections/population` contains data of population per canton, nationality, gender and age from 2024-2055. All projections are according to the BfS reference scenario.
-    - On the webpage below select for Kanton: all except Schweiz; Staatsangehörigkeit (Kategorie): Schweiz and Ausland; Geschlecht: Mann and Frau; Alter: all except Total; Jahr: all; Beobachtungseinheit: Bevölkerungsstand am 1. Januar. Click on Weiter. On the left side in the dropdwon menu select `Ergebnis speichern asl... Excel`, and place the downloaded file in the `projections/population` folder
-    - State: 2024
+    - Content: `projections/raw/px-x-0104020000_101_*.csv` contains original population CSV responses for 2024–2055 from reference scenario **AR-00-2025**, downloaded in four-year chunks. `scaling_year` selects the target year.
+    - The download selects all 26 cantons, Swiss/foreign nationality, both sexes, ages 0 through 100+ without totals, and **Bevölkerungsstand am 31. Dezember**. Preserve the official comma-delimited Windows-1252 files unchanged; the raw stage decodes and combines them. No manual CSV conversion is needed.
+    - `scaling_year: 2025` now means **31 December 2025**. January stocks use age attained during the coming year and cannot be substituted directly. The reader rejects a January-only extract; it preserves actual STATPOP ages and constructs year-end control groups instead.
+    - State: 2025
     - Contract:
         - Projections: [Open Data](https://www.pxweb.bfs.admin.ch/pxweb/de/px-x-0104020000_101/px-x-0104020000_101/px-x-0104020000_101.px)
 - Freight:
@@ -248,10 +295,13 @@ Finally your data folder should look something like this:
 |   +--- etappen.csv
 |   +--- haushaltspersonen.csv
 +--- projections
-|   +--- households
-|   |   +--- su-d-01.03.03.01.xlsx
-|   +--- population
-|   |   +--- px-x-0104020000_101_20250808-151932.csv
+|   +--- raw
+|   |   +--- DF_SCEN_MENAGES.csv
+|   |   +--- px-x-0104020000_101.metadata.json
+|   |   +--- px-x-0104020000_101_2024_2027.csv
+|   |   +--- px-x-0104020000_101_2024_2027.query.json
+|   |   +--- ... remaining four-year CSV chunks and query files through 2055 ...
+|   |   +--- manifest.json
 +--- spatial
 |   +--- municipality
 |   |   +--- 2023

@@ -1,16 +1,23 @@
 import pandas as pd
 import geopandas as gpd
-import data.spatial.ovgk
+from data.spatial.ovgk import impute as impute_ovgk
 from data.cross_border.destinations import make_entry_border_facility_id, make_exit_border_facility_id
+from synthesis.population.spatial.secondary_nn.tools import NN_ALGORITHMS, add_osm_destinations
+
+from data.cross_border.count_assignment_inputs import configure_reference, assigned_reference
 
 
 def configure(context):
     context.stage("synthesis.population.destinations_statent")
     context.stage("synthesis.population.spatial.primary.work.remote_locations", alias="remote_work_locations")
-    context.stage("data.cross_border.swiss_residents_od")
+    configure_reference(context)
     context.stage("data.spatial.ovgk")
     context.stage("data.spatial.municipality_types")
     context.stage("data.spatial.municipalities")
+    context.config("locations_algorithm", "rda")
+    context.config("secondary_nn_osm_destination_radius_m", 50.0)
+    if context.config("locations_algorithm").lower() in NN_ALGORITHMS:
+        context.stage("data.osm.secondary_features")
     context.config("generate_outbound_flows", False)
     context.config("include_cross_border", default=False)
 
@@ -44,7 +51,7 @@ def build_border_destinations(context):
 
         border_frames.append(pd.concat([entry, exit], ignore_index=True, sort=False))
 
-    df_cb = context.stage("data.cross_border.swiss_residents_od")[["cross_border_person_id", "border_crossing_point"]].copy()
+    df_cb = assigned_reference(context)[["cross_border_person_id", "border_crossing_point"]].copy()
 
     # Swiss residents are sampled later as either home -> border or border -> home,
     # so both directional facilities must exist before MATSim writes facilities.
@@ -78,7 +85,7 @@ def build_border_destinations(context):
         df[column] = False
 
     df_ovgk = context.stage("data.spatial.ovgk")
-    df_spatial = data.spatial.ovgk.impute(context, df_ovgk, df, ["destination_id"], chunk_size=1e3, point_type="border_facility")
+    df_spatial = impute_ovgk(context, df_ovgk, df, ["destination_id"], chunk_size=1e3, point_type="border_facility")
     df = df.merge(df_spatial[["destination_id", "ovgk"]], how="left", on="destination_id")
 
     df_municipality_type = context.stage("data.spatial.municipality_types")
@@ -130,4 +137,13 @@ def execute(context):
     df_destinations = df_destinations.groupby("destination_id", as_index = False).agg(aggregation)
     df_destinations = gpd.GeoDataFrame(df_destinations, geometry = "geometry", crs = df_borders.crs)
 
+    # Fill gaps in the NN leisure catalogue without creating employment locations.
+    if context.config("locations_algorithm").lower() in NN_ALGORITHMS:
+        municipalities, _ = context.stage("data.spatial.municipalities")
+        municipalities = municipalities.merge(context.stage("data.spatial.municipality_types"))
+        df_destinations = add_osm_destinations(
+            df_destinations, context.stage("data.osm.secondary_features"),
+            municipalities, context.stage("data.spatial.ovgk"),
+            radius_m=float(context.config("secondary_nn_osm_destination_radius_m")),
+        )
     return df_destinations

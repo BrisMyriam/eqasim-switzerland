@@ -68,11 +68,13 @@ class Network:
             self.links["attributes"] = None
             return
 
-        # As a single column containing dicts
-        link_attrs = self.link_attrs.groupby('link_id').apply(lambda x: dict(zip(x['name'], x['value']))).reset_index(name='attributes')
-        self.links = self.links.merge(link_attrs, on="link_id",how="left")
-        self.links.loc[self.links["attributes"].isna(), "attributes"] = None
-        
+        attributes = {}
+        for link_id, name, value in zip(self.link_attrs.link_id.to_numpy(),
+                                        self.link_attrs.name.to_numpy(),
+                                        self.link_attrs.value.to_numpy()):
+            attributes.setdefault(link_id, {})[name] = value
+        self.links["attributes"] = [attributes.get(link_id) for link_id in self.links.link_id.to_numpy()]
+
     def __len__(self):
         return len(self.links)
     
@@ -271,13 +273,6 @@ class Network:
         return gpd.GeoDataFrame(links_centers[["link_id"]], geometry=geometry, crs="EPSG:2056")
 
 
-
-
-
-
-
-
-
 def _iterparse(source):
     # lxml supports huge_tree for large XML files; stdlib ElementTree does not.
     try:
@@ -420,7 +415,19 @@ def parse_links(content, skip_attributes):
     return links, link_attrs
 
 
-def read_network(filename, skip_attributes=False, only_car_links=False):
+def read_network(filename, skip_attributes=False, only_car_links=False, context=None):
+    """Read XML using C++ when available, or reuse its shared binary cache.
+
+    Pass a Synpp context to cache in context.working_directory. Cache identity
+    includes the absolute source path, nanosecond mtime, size, attribute option,
+    and reader schema version. Car filtering does not alter the stored network.
+    Without a context, reading still works but no binary network cache is used.
+    """
+    from matsim.network_reader import read_network_cached
+    return read_network_cached(filename, context, skip_attributes, only_car_links)
+
+
+def _read_network_xml(filename, skip_attributes=False, only_car_links=False):
     """Read a MATSim network.xml.gz file. Returns a Network object with dataframes
     for nodes, links, node_attributes, and link_attributes. If the network has a CRS
     projection set, it will be available in network_attrs."""
@@ -453,9 +460,15 @@ class Plans:
         self.legs = legs
         self.routes = routes
 
+def _iterparse_file(filename):
+    """Feed bytes to the XML parser and close plain or compressed input files."""
+    with xopen.xopen(filename, "rb") as stream:
+        yield from _iterparse(stream)
+
+
 def plan_reader(filename, selected_plans_only = False):
     person = None
-    tree = ET.iterparse(xopen.xopen(filename), events=['start','end'])
+    tree = _iterparse_file(filename)
     
     for xml_event, elem in tree:
         if elem.tag == 'person' and xml_event == 'start':
@@ -495,7 +508,7 @@ def _parseAttributes(elem, dict):
 # Route :leg_id
 # The column names of the dataframes are the same as the attribute names (<name:'value'> and <attribute> are parsed)
 def plan_reader_dataframe(filename, selected_plans_only = False):
-    tree = ET.iterparse(xopen.xopen(filename), events=['start','end'])
+    tree = _iterparse_file(filename)
     
     persons = []
     plans = []
@@ -618,3 +631,67 @@ def plan_reader_dataframe(filename, selected_plans_only = False):
 
 
 
+###################################################################################
+########################    Household reader    ###################################
+###################################################################################
+class Household:
+    def __init__(self, households):
+        self.households = households
+
+
+# Parses attributes of an element and adds them to the given dictionary
+def parse_attributes(elem, dict):
+    for attrib in elem.attrib:
+        dict[attrib] = elem.attrib[attrib]
+    return dict
+
+
+# Returns households as a dataframe
+def houshold_reader(filename, convert_dataframes_types = True):
+    tree = _iterparse_file(filename)
+    
+    households        = []
+    current_persons   = []
+    current_household = {}
+    
+    for xml_event, elem in tree:
+        elem_tag = elem.tag.rsplit("}", 1)[-1]  # Accept namespaced and plain XML.
+        
+        # HOUSEHOLDS
+        if elem_tag == "household":
+
+            if xml_event == "start":
+                parse_attributes(elem, current_household)
+
+            else:
+                current_household["members"] = current_persons
+                households.append(current_household)
+
+                current_household = {}
+                current_persons   = []
+
+                elem.clear()
+
+        # ATTRIBUTES
+        elif elem_tag == "attribute":
+            current_household[elem.attrib["name"]] = elem.text
+        
+        # MEMBERS
+        elif elem_tag == "personId" and xml_event == "start":
+            current_persons.append(int(elem.attrib["refId"]))
+    
+    
+    # Convert to dataframe and converts columns types
+    households = pd.DataFrame.from_records(households)
+
+    if convert_dataframes_types:
+
+        try:
+            households["id"]               = households["id"].astype(int)
+            households["censusId"]         = households["censusId"].astype(int)
+            households["household_income"] = households["household_income"].astype(float)
+
+        except KeyError:
+            logger.warning("Dataframe types conversion failed")
+    
+    return Household(households)

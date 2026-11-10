@@ -1,12 +1,23 @@
 import shutil
 import os.path
-import matsim.runtime.eqasim as eqasim
-from dmc.constants import constants as dmc_constants
-from matsim.simulation.cross_border_links import patch_directional_border_links
+import hashlib
+from pathlib import Path
 
-import matsim.simulation.config_utils as config_utils
+import matsim.runtime.eqasim as eqasim
+from matsim.config import config as shared_config
+from matsim.simulation.cross_border_links import patch_directional_border_links
+from matsim.simulation.border_endpoints import patch_border_endpoints
+from matsim.simulation.border_route_choice import repair_grouped_crossings
+
+import matsim.config.tools as config_tools
+from mode_choice.routing import options as routing_options
+from mode_choice.routing.eqasim import exports as routing_exports
+
+from data.cross_border.count_assignment_inputs import configure_reference, assigned_reference
+
 
 def configure(context):
+    context.stage("matsim.config.config")
     context.stage("matsim.runtime.java")
     context.stage("matsim.runtime.eqasim")
         
@@ -15,38 +26,64 @@ def configure(context):
     context.stage("matsim.scenario.vehicles")
 
     context.stage("matsim.scenario.facilities")
-    context.stage("matsim.scenario.network.mapped")
+    context.stage("matsim.scenario.network.pt")
 
     context.stage("data.pt_pricing.pt_pricing")
     context.stage("calibration.pt_routing.pt_routing_parameters")
         
     context.stage("data.microcensus.shares")
-    context.stage("dmc.params")
-    context.stage("calibration.car_routing_vot.optimal_value")
+    context.stage("dmc.parameter_files")
 
     context.config("input_downsampling")
-    context.config("threads")
+    context.config("threads", volatile=True)
+    context.config("java_memory", "50G", volatile=True)
     context.config("random_seed")
+    context.config("use_vdf", False)
+    context.config("export_detailed_network", True)
+    context.config("last_iteration", 140)
+    context.config("calibrate_alphas_in_matsim", True)
+    context.config("alphaCalibration.level", 'canton')
+    context.config("calibrate_betas_in_matsim", False)
+    context.config("activate_traffic_light_delays", True)
+    context.config("activate_unsignalized_intersections_delays", True)
+    context.config("correct_links_capacity", True)
+    context.config("minimum_speed", 1.0)
+    context.config("preventwaitingtoentertraffic", False)
+    context.config("writeexperiencedplans", False)
     
     context.config("output_prefix", "switzerland_")
-    context.config("useScheduleBasedTransport", default = True)
-    context.config("car_cost_model", dmc_constants.CAR_COST_MODEL)
+    context.config("useScheduleBasedTransport", default = False)
     context.config("route_bike", True)
+    context.config("enable_mode_choice", False)
+    if context.config("enable_mode_choice"):
+        routing_options.configure(context)
+        if context.config("route_population_once"):
+            routing_exports.configure(context)
     context.config("include_cross_border", default=False)
-    context.stage("data.cross_border.swiss_residents_od")
+    configure_reference(context)
     context.stage("data.spatial.swiss_border")
+    context.config("cross_border_route_repair", True)
+    if context.config("cross_border_route_repair"):
+        context.stage("data.cross_border.road_candidates")
 
     if context.config("include_cross_border"):
         context.stage("data.cross_border.destinations")
+        context.config("cross_border_boundary_endpoints", True)
+        if context.config("cross_border_boundary_endpoints"):
+            context.stage("data.cross_border.through_crossings")
+            context.stage("data.cross_border.population")
+            context.stage("data.cross_border.generate_cross_border_traffic")
+            if context.config("cross_border_route_repair"):
+                context.stage("data.cross_border.sample")
 
     # network calibration
-    context.config("network_calibration.activate", default=False)
+    context.config("network_calibration.activate", default=True)
     context.config("network_calibration.calibrate_disutilities", default=True)
     context.config("network_calibration.calibrate_freespeed", default=True)
     context.config("network_calibration.calibrate_agents_ascs", default=True)
     context.config("network_calibration.calibrate_subpopulations", default=True)
 
-    need_counts = config_utils.need_counts_file(context)
+    need_counts = config_tools.need_counts_file(context)
     if context.config("network_calibration.activate") and need_counts:
         context.stage("analysis.counts.target")
         if context.config("network_calibration.calibrate_disutilities"):
@@ -59,14 +96,17 @@ def configure(context):
 
 
 def execute(context):
-    # Some files we just copy
-    transit_vehicles_input_path  = context.stage("matsim.scenario.network.mapped")["vehicles"]
+
+    # Copy shared scenario inputs into this stage before preparing them.
+
+
+    transit_vehicles_input_path  = context.stage("matsim.scenario.network.pt")["vehicles"]
     transit_vehicles_output_path = "%s/%stransit_vehicles.xml.gz" % (context.path(), context.config("output_prefix"))
 
     sample_size     = context.config("input_downsampling")
 
     if context.config("input_downsampling") < 1.0 and not context.config("useScheduleBasedTransport"):
-        config_utils.modify_PCEs(transit_vehicles_input_path, transit_vehicles_output_path, sample_size)
+        config_tools.modify_PCEs(transit_vehicles_input_path, transit_vehicles_output_path, sample_size)
 
     else:
         shutil.copyfile(transit_vehicles_input_path, transit_vehicles_output_path)
@@ -81,6 +121,7 @@ def execute(context):
     shutil.copyfile(households_input_path, households_output_path)
 
     # PT pricing
+
     sbb_path, zones_path, pricing_path = context.stage("data.pt_pricing.pt_pricing")
 
     sbb_output_path =  f"{context.path()}/SBB_all_distances.csv" 
@@ -93,6 +134,7 @@ def execute(context):
     shutil.copy(pricing_path, pricing_output_path)
 
     # copy the mode shares        
+
     global_shares_path, cantonal_shares_path = context.stage("data.microcensus.shares")
     shutil.copyfile(global_shares_path, 
                     "%s/%sglobal_mode_shares.csv" % (context.path(), context.config("output_prefix")))
@@ -100,25 +142,32 @@ def execute(context):
                     "%s/%scantonal_mode_shares.csv" % (context.path(), context.config("output_prefix")))
     
     # copy the mode choice params
-    mode_params_path, cost_params_path = context.stage("dmc.params")
+
+    mode_params_path, cost_params_path = context.stage("dmc.parameter_files")
     mode_parameters_path = "%s/dmc_parameters.yml" % context.path()
     cost_parameters_path = "%s/cost_parameters.yml" % context.path()
     shutil.copy(mode_params_path, mode_parameters_path)
     shutil.copy(cost_params_path, cost_parameters_path)
 
-    # Some files we send through several preparation scripts
-    
-    # Run preparation
+    if context.config("export_detailed_network"):
+        shutil.copyfile(
+            context.stage("matsim.scenario.network.pt")["geometry"],
+            "%s/%sdetailed_network.csv" % (context.path(), context.config("output_prefix")),
+        )
+
+    # Prepare facilities, population and network.
+
     facilities_input_path = context.stage("matsim.scenario.facilities")
     facilities_output_path = "%sfacilities.xml.gz" % context.config("output_prefix")
     
     population_input_path = context.stage("matsim.scenario.population")
     population_prepared_path = "prepared_population.xml.gz"
     
-    network_input_path = context.stage("matsim.scenario.network.mapped")["network"]
+    network_input_path = context.stage("matsim.scenario.network.pt")["network"]
     network_output_path = "%snetwork.xml.gz" % context.config("output_prefix")
 
     # Call the basic preparation script
+
     eqasim.run(context, "org.eqasim.core.scenario.preparation.RunPreparation", [
         "--input-facilities-path", facilities_input_path,
         "--output-facilities-path", facilities_output_path,
@@ -136,35 +185,82 @@ def execute(context):
     # Java assigns facility links by nearest coordinate only. For directional
     # cross-border facilities we patch the prepared files in Python so entry and
     # exit activities use opposite one-way links before the population is routed.
+
     cross_border_destinations = None
     if context.config("include_cross_border"):
         cross_border_destinations = context.stage("data.cross_border.destinations")
 
-    patch_directional_border_links(
+    border_links = patch_directional_border_links(
         cross_border_destinations,
-        context.stage("data.cross_border.swiss_residents_od"),
+        assigned_reference(context),
         context.stage("data.spatial.swiss_border"),
         "%s/%snetwork.xml.gz" % (context.path(), context.config("output_prefix")),
         "%s/%sfacilities.xml.gz" % (context.path(), context.config("output_prefix")),
         "%s/prepared_population.xml.gz" % context.path(),
         max_workers=context.config("threads"),
+        geometry_path=context.stage("matsim.scenario.network.pt")["geometry"],
+        context=context,
     )
 
-    # Generate the config file
+    # Repair ambiguous grouped crossings using the actual Swiss activity links.
+    # Keep these overrides local: upstream demand and facility caches are shared.
+    # Foreign repairs require boundary endpoints, which align their approach with
+    # the new crossing. Without them, only the Swiss one-way plans are repaired.
+
+    if context.config("cross_border_route_repair"):
+        repair_foreign = (context.config("include_cross_border")
+                          and context.config("cross_border_boundary_endpoints"))
+        repaired_destinations = repair_grouped_crossings(
+            context, Path(context.path()) / network_output_path,
+            Path(context.path()) / population_prepared_path,
+            Path(context.path()) / facilities_output_path,
+            context.stage("matsim.scenario.network.pt")["geometry"], border_links,
+            destinations=cross_border_destinations if repair_foreign else None)
+        if repair_foreign:
+            cross_border_destinations = repaired_destinations
+
+    # Replace foreign car visitors' and transit agents' approaches only after their
+    # surveyed crossings have received directional links on the prepared network.
+    # Give only these terminal buffers generous flow/storage capacity; the real
+    # crossing links retain their capacity and remain the physical bottlenecks.
+
+    boundary_endpoint_count = 0
+    if context.config("include_cross_border") and context.config("cross_border_boundary_endpoints"):
+        routing_config = config_tools.get_module(
+            config_tools.read_config(context.stage("matsim.config.config")), "routing")
+        network_modes = config_tools.get_param("networkModes", routing_config)
+        network_modes = (network_modes.get("value") if network_modes is not None else "car")
+        boundary_endpoint_count = patch_border_endpoints(
+            cross_border_destinations,
+            context.stage("data.cross_border.population"),
+            context.stage("data.cross_border.generate_cross_border_traffic")[0],
+            border_links,
+            context.stage("data.spatial.swiss_border"),
+            Path(context.path()) / network_output_path,
+            Path(context.path()) / population_prepared_path,
+            (Path(context.path()) / (context.config("output_prefix") + "detailed_network.csv")
+             if context.config("export_detailed_network") else None),
+            context=context,
+            facilities_path=Path(context.path()) / facilities_output_path,
+            network_modes=[mode.strip() for mode in network_modes.split(",") if mode.strip()],
+            through_crossings=context.stage("data.cross_border.through_crossings"),
+        )
+
+    # Copy the shared config before applying this scenario's local settings.
+
     config_path = "%sconfig.xml" % context.config("output_prefix")
-    eqasim.run(context, "org.eqasim.core.scenario.config.RunGenerateConfig", [
-        "--output-path", config_path,
-        "--prefix", context.config("output_prefix"),
-        "--sample-size", context.config("input_downsampling"),
-        "--random-seed", context.config("random_seed"),
-        "--threads", context.config("threads"),
-        "--eqasim-configurator", "org.eqasim.switzerland.ch_cmdp.SwitzerlandConfigurator"
-    ])
-    
-    assert os.path.exists("%s/%sconfig.xml" % (context.path(), context.config("output_prefix")))
-    
+    local_config_path = os.path.join(context.path(), config_path)
+    config_tools.copy_config(context.stage("matsim.config.config"), local_config_path)
+
+    shared_config.adapt_for_routing(context, local_config_path, local=True)
+
+    # Keep calibration inputs portable before routing, using the shared copier.
+    config_tools.change_params(local_config_path,
+        config_tools.copy_network_calibration_files(context), create=True)
+
     # Calculate the stop categories
-    transit_schedule_input_path = context.stage("matsim.scenario.network.mapped")["schedule"]
+
+    transit_schedule_input_path = context.stage("matsim.scenario.network.pt")["schedule"]
     transit_schedule_output_path = "%stransit_schedule.xml.gz" % context.config("output_prefix")
 
     eqasim.run(context, "org.eqasim.switzerland.ch.scenario.RunCalculateStopCategories", [
@@ -174,55 +270,55 @@ def execute(context):
     
     assert os.path.exists("%s/%stransit_schedule.xml.gz" % (context.path(), context.config("output_prefix")))
 
-    # Adapt the config
-    eqasim.run(context, "org.eqasim.switzerland.ch_cmdp.scenario.RunAdaptConfig", [
-        "--input-path", config_path,
-        "--output-path", config_path,
-        "--downsamplingRate", context.config("input_downsampling"),
-        "--replanningRate", "0.05",
-        "--hasFreight", context.config("use_freight"),
-        "--prefix", context.config("output_prefix"),
-        "--carCostModel", context.config("car_cost_model").lower(),
-        "--routingDistanceUtility", context.stage("calibration.car_routing_vot.optimal_value"),
-        "--routeBikeInNetwork", str(context.config("route_bike")).lower()
-        ]
-        + config_utils.network_calibration_files_paths(context)
-        )
-    
-    assert os.path.exists("%s/%sconfig.xml" % (context.path(), context.config("output_prefix")))
 
-    # If we want to simulate buses, some lines have to be added to the config.
-    if not context.config("useScheduleBasedTransport"):
-        config_utils.add_SBBPT_module(context)
+    # The real road network was checked before adding the boundary terminals.
+    # MATSim's default check would remove these intentional one-way sources and
+    # sinks, then abort. Keep this setting in the exported simulation config too.
+    if boundary_endpoint_count:
+        config_tools.change_params(local_config_path,
+                                   {"routing.networkRouteConsistencyCheck": "disable"}, create=True)
 
-    # Create the module for PT pricing
-    config_utils.add_ptZones_module(context)
-
-    # Write PT routing parameters within the config
-    pt_parameters = context.stage("calibration.pt_routing.pt_routing_parameters")
-    config_utils.adjust_pt_routing_parameters(context, pt_parameters)
 
     # Route the population
+
     population_output_path = "%s/%spopulation.xml.gz" % (context.path(), context.config("output_prefix"))
 
-    # routing class does not work with turn restrictions; it seems something to do with multi-threading as
-    # it works when we use 1 thread; this ius however not an issue as MATSim routes teverything in iteration 0
-    eqasim.run(context, "org.eqasim.core.scenario.routing.RunPopulationRouting", [
+    routing_arguments = [
         "--config-path", config_path,
         "--output-path", population_output_path,
         "--threads", context.config("threads"),
         "--config:plans.inputPlansFile", population_prepared_path,
         "--eqasim-configurator", "org.eqasim.switzerland.ch_cmdp.SwitzerlandConfigurator"
-    ])
+    ]
+    if context.config("enable_mode_choice") and context.config("route_population_once"):
+        routing_arguments.extend(["--routes-path", routing_exports.population_routes(context)])
+    eqasim.run(context, "org.eqasim.core.scenario.routing.RunPopulationRouting", routing_arguments)
     
     assert os.path.exists("%s/%spopulation.xml.gz" % (context.path(), context.config("output_prefix")))
 
     # Validate the scenario
+
     eqasim.run(context, "org.eqasim.core.scenario.validation.RunScenarioValidator", [
         "--config-path", config_path
     ])
     
+    # Finish the portable simulation config after routing and validation.
+
+    config_path = shared_config.adapt_for_simulation(context, local_config_path, local=True)
+
     # Cleanup
+
     os.remove("%s/prepared_population.xml.gz" % context.path())
 
-    return "%sconfig.xml" % context.config("output_prefix")
+    return config_path
+
+
+def validate(context):
+    # Synpp hashes this stage module, but imported helpers/source-launch Java are
+    # separate files. Include them so a repair update cannot reuse stale plans.
+    if context.config("cross_border_route_repair"):
+        digest = hashlib.sha256()
+        for name in ["border_route_choice.py", "BorderRouteQueries.java"]:
+            digest.update(Path(__file__).with_name(name).read_bytes())
+        return digest.hexdigest()
+    return None

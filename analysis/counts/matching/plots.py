@@ -14,6 +14,7 @@ import seaborn as sns
 import pandas as pd
 import geopandas as gpd
 from .counts import Counts
+from .detailed_statistics import DETAIL_COLOR_LABELS, SWISS_RATIO, FOREIGN_SHARE
 from .network import RoadNetwork
 import numpy as np
 import matplotlib.cm as cm
@@ -48,6 +49,8 @@ TRANSCALITY_FLOW_MAP_TOOLTIP_FIELDS = [
     "daily_profile",
 ]
 FLOW_MAP_FIELD_LABELS = {
+    "construction_affected": "Construction affected",
+    "construction_reason": "Construction flag reason",
     "link_id": "Link ID",
     "id": "Station",
     "matched_link_ids": "Matched link ID(s)",
@@ -136,7 +139,7 @@ class Plotter:
             )
 
         flow_columns = ["id", "flow", "simulated_flow", "pdiff", "adiff"]
-        for optional_column in ("directions_represented", "matched_link_ids", "link_id", "period_hours", "flow_period"):
+        for optional_column in ("directions_represented", "matched_link_ids", "link_id", "period_hours", "flow_period", "construction_affected", "construction_reason"):
             if optional_column in flows.columns:
                 flow_columns.append(optional_column)
         result = points[["id", "geometry"]].merge(
@@ -161,12 +164,17 @@ class Plotter:
                 else 2
             )
         result["directions_represented"] = directions_represented
+        # Combining daily authorities with Transcality creates NaNs for stages
+        # that do not provide duration metadata. Preserve explicit peak windows.
+        result["period_hours"] = (
+            result["period_hours"].fillna(24) if "period_hours" in result else 24
+        )
         result["geh"] = GEH(
             result["flow"],
             result["simulated_flow"],
             return_vector=True,
             directions_represented=directions_represented,
-            period_hours=result.get("period_hours", 24),
+            period_hours=result["period_hours"],
         ).round(2)
         return gpd.GeoDataFrame(result, geometry="geometry", crs=points.crs)
 
@@ -485,7 +493,7 @@ class Plotter:
         if matched is not None:
             matched_ids = matched.link_id.unique()
             matched_links = network.get_link_geometries(
-                matched_ids, expand_merged=True
+                matched_ids
             )
             matched_links.plot(ax=ax, color='blue', linewidth=2*lw)
             
@@ -563,6 +571,10 @@ class Plotter:
     @staticmethod
     def _build_tooltip_html(row, fields):
         rows = []
+        fields = sorted(fields, key=lambda field: field != "daily_profile")
+        category_fields = [field for field in fields if field.endswith("(raw vehicle passages)")]
+        category_max = max([float(row[field]) for field in category_fields
+                            if field in row and pd.notna(row[field])] or [1]) or 1
         for field in fields:
             if field not in row:
                 continue
@@ -570,16 +582,28 @@ class Plotter:
                 profile = row[field]
                 if isinstance(profile, str) and profile:
                     rows.append(
-                        '<tr><td colspan="2"><b>Observed daily profile:</b><br>'
+                        '<tr><td colspan="2"><b>Daily traffic profile (vehicles/hour):</b><br>'
                         + profile
                         + "</td></tr>"
                     )
                 continue
             value = Plotter._tooltip_value(row[field])
+            if field == SWISS_RATIO and value is None:
+                value = "Undefined (zero French + cross-border, or missing statistics)"
+            if field == FOREIGN_SHARE and value is None:
+                value = "Undefined (zero total cars, or missing statistics)"
             if value is None:
                 continue
+            if field in category_fields:
+                label = field.removeprefix("MATSim ").removesuffix(" (raw vehicle passages)").removeprefix("cars ")
+                width = max(0, min(100, float(row[field]) / category_max * 100))
+                rows.append(f'<tr><td>{escape(label.capitalize())}</td><td>'
+                            f'<div class="counts-stat"><div class="counts-stat-track">'
+                            f'<div style="width:{width:.2f}%"></div></div>'
+                            f'<span>{float(row[field]):,.0f}</span></div></td></tr>')
+                continue
             label = FLOW_MAP_FIELD_LABELS.get(
-                field, field.replace("_", " ").title()
+                field, DETAIL_COLOR_LABELS.get(field, field.replace("_", " ").title())
             )
             if "flow_period" in row and pd.notna(row["flow_period"]):
                 label = label.replace("vehicles/day", f"vehicles/{row['flow_period']}")
@@ -589,7 +613,7 @@ class Plotter:
         return "<table>" + "".join(rows) + "</table>"
 
     @staticmethod
-    def flow_profile_svg(profile):
+    def flow_profile_svg(profile, simulated_profile=None):
         """Render a trusted Transcality hourly profile as compact tooltip SVG."""
         if isinstance(profile, str):
             try:
@@ -610,11 +634,19 @@ class Plotter:
         if not len(hours):
             return ""
 
-        width, height = 300, 135
-        left, right, top, bottom = 36, 8, 10, 24
+        simulated_hours = np.asarray((simulated_profile or {}).get("hour", []), dtype=float)
+        simulated_flow = np.asarray((simulated_profile or {}).get("flow", []), dtype=float)
+        if len(simulated_hours) != len(simulated_flow):
+            raise ValueError("Simulated profile hours and flows must have equal lengths.")
+        valid_simulated = np.isfinite(simulated_hours) & np.isfinite(simulated_flow)
+        simulated_hours, simulated_flow = simulated_hours[valid_simulated], simulated_flow[valid_simulated]
+
+        width, height = 340, 155
+        left, right, top, bottom = 42, 8, 28, 24
         plot_width = width - left - right
         plot_height = height - top - bottom
-        maximum = max(float(np.max(upper)), float(np.max(flow)), 1.0)
+        maximum = max(float(np.max(upper)), float(np.max(flow)),
+                      float(np.max(simulated_flow)) if len(simulated_flow) else 0, 1.0)
 
         def point(hour, value):
             x = left + ((hour + 0.5) / 24) * plot_width
@@ -626,6 +658,12 @@ class Plotter:
             + [point(hour, value) for hour, value in zip(hours[::-1], lower[::-1])]
         )
         line = " ".join(point(hour, value) for hour, value in zip(hours, flow))
+        simulated_line = " ".join(point(hour, value) for hour, value in zip(simulated_hours, simulated_flow))
+        simulation_svg = (
+            f'<polyline points="{simulated_line}" fill="none" stroke="#d95f02" stroke-width="2"/>'
+            '<line x1="218" y1="10" x2="230" y2="10" stroke="#d95f02" stroke-width="2"/>'
+            '<text x="233" y="13" font-size="9" fill="#333">MATSim motor flow</text>'
+        ) if len(simulated_flow) else ""
         ticks = "".join(
             f'<text x="{left + hour / 24 * plot_width:.1f}" y="{height - 7}" '
             f'text-anchor="middle" font-size="9" fill="#333">{hour}</text>'
@@ -638,13 +676,14 @@ class Plotter:
             f'<line x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}" stroke="#555"/>'
             f'<polygon points="{band}" fill="#bdbdbd" fill-opacity="0.65"/>'
             f'<polyline points="{line}" fill="none" stroke="#2166ac" stroke-width="2"/>'
+            f'{simulation_svg}'
             f'<text x="3" y="{top+7}" font-size="9" fill="#333">{maximum:.0f}</text>'
             f'<text x="3" y="{height-bottom+3}" font-size="9" fill="#333">0</text>'
             f'{ticks}'
-            '<rect x="170" y="4" width="12" height="7" fill="#bdbdbd" fill-opacity="0.65"/>'
-            '<text x="185" y="11" font-size="9" fill="#333">Q25–Q75</text>'
-            '<line x1="235" y1="8" x2="247" y2="8" stroke="#2166ac" stroke-width="2"/>'
-            '<text x="250" y="11" font-size="9" fill="#333">flow</text>'
+            '<rect x="42" y="6" width="12" height="7" fill="#bdbdbd" fill-opacity="0.65"/>'
+            '<text x="57" y="13" font-size="9" fill="#333">Q25–Q75</text>'
+            '<line x1="123" y1="10" x2="135" y2="10" stroke="#2166ac" stroke-width="2"/>'
+            '<text x="138" y="13" font-size="9" fill="#333">Observed</text>'
             "</svg>"
         )
 
@@ -724,6 +763,17 @@ class Plotter:
                 "step": 1,
             }
 
+        for field, label in DETAIL_COLOR_LABELS.items():
+            if not any(field in gdf for gdf in valid_points):
+                continue
+            values = pd.concat([pd.to_numeric(gdf[field], errors="coerce")
+                                for gdf in valid_points if field in gdf])
+            finite = values[np.isfinite(values)]
+            maximum = finite.max() if not finite.empty else 0
+            # This is a ratio, not a share of all cars: it can exceed 100%.
+            upper = max(100.0 if field in (SWISS_RATIO, FOREIGN_SHARE) else 1.0, float(np.ceil(maximum)))
+            settings[field] = {"label": label, "lower": 0.0, "upper": upper, "step": 1}
+
         periods = {str(value) for gdf in valid_points if "flow_period" in gdf
                    for value in gdf["flow_period"].dropna().unique()}
         if len(periods) == 1 and "adiff" in settings:
@@ -748,7 +798,7 @@ class Plotter:
             return points, False
         originals, closest = [], []
         for index, row in points.iterrows():
-            fields = ["flow", "pdiff", "adiff", "geh", "_tooltip_html"]
+            fields = ["flow", "pdiff", "adiff", "geh", "_tooltip_html", "_details_html"]
             originals.append({field: row[field] for field in fields})
             if not valid.loc[index]:
                 closest.append(None)
@@ -765,23 +815,45 @@ class Plotter:
                 directions_represented=row.get("directions_represented", 2),
                 period_hours=row.get("period_hours", 24),
             )[0])
-            adjusted["_tooltip_html"] = (
+            adjusted["_details_html"] = (
                 "<b>Closest count within bounds (optimistic comparison)</b><br>"
                 + Plotter._build_tooltip_html(adjusted, tooltip_fields)
                 + "<br><b>Original traffic count:</b> " + escape(str(row["flow"]))
             )
+            adjusted["_tooltip_html"] = Plotter._build_tooltip_html(adjusted, FLOW_MAP_TOOLTIP_FIELDS)
             closest.append({field: adjusted[field] for field in fields})
         points["_original_count"] = originals
         points["_closest_count"] = closest
         return points, True
 
     @staticmethod
-    def _inject_flow_metric_controls(path_to_save, metric_settings, has_count_bounds=False):
+    def _inject_flow_metric_controls(path_to_save, metric_settings, has_count_bounds=False,
+                                     has_construction=False, show_construction=True):
         if not metric_settings:
             return
 
         controls = """
-<div id="counts-map-controls">
+<details id="counts-map-controls" open>
+  <summary>Map settings</summary>
+  <div class="counts-settings-body">
+  <label id="counts-connectors-control" class="counts-checkbox-row" hidden><input id="counts-show-connectors" type="checkbox"> Show matched-link connectors</label>
+  __CONSTRUCTION_CONTROL__
+  <div class="counts-quality-section">
+    <label><input id="counts-filter-enabled" type="checkbox"> Filter count points</label>
+    <div id="counts-filter-parameters" class="counts-filter-parameters" inert><div>
+    <label for="counts-filter-metric">Filter metric</label>
+    <select id="counts-filter-metric" disabled></select>
+    <label for="counts-filter-sign">Comparison</label>
+    <select id="counts-filter-sign" disabled>
+      <option value="higher">Higher than (&gt;)</option>
+      <option value="lower">Lower than (&lt;)</option>
+    </select>
+    <label for="counts-filter-value">Value (in the selected metric's units)</label>
+    <input id="counts-filter-value" type="number" step="any" value="5" disabled>
+    <div id="counts-filter-error" style="display:none">Enter a finite threshold.</div>
+    <div>Uses displayed, signed differences; points without this metric are hidden when filtering.</div>
+    </div></div>
+  </div>
   __COUNT_MODE_CONTROL__
   <div class="counts-control-title">Count point colors</div>
   <label for="counts-color-metric">Metric</label>
@@ -820,24 +892,41 @@ class Plotter:
     </div>
     <div id="counts-quality-error">Thresholds must be non-negative numbers.</div>
   </div>
-</div>
+  </div>
+</details>
+<section id="counts-point-details" hidden aria-label="Station details">
+  <div id="counts-details-resize" role="separator" aria-orientation="vertical"
+       aria-label="Resize station details" tabindex="0" title="Drag left to widen; use left/right arrows"></div>
+  <button id="counts-details-close" type="button">Back to map settings</button>
+  <h3>Station details</h3>
+  <div id="counts-details-content"></div>
+</section>
 """
         controls = controls.replace("__COUNT_MODE_CONTROL__", """
-  <label for="counts-count-mode">Traffic counts</label>
-  <select id="counts-count-mode">
-    <option value="original">Original counts</option>
-    <option value="closest">Closest within bounds (optimistic)</option>
-  </select>
+  <div class="counts-mode-row"><span>Traffic counts</span>
+    <label class="counts-mode-switch">
+      <input id="counts-count-mode" type="checkbox" role="switch" aria-label="Use closest counts within bounds">
+      <span class="counts-mode-options"><span>Original</span><span>Closest</span></span>
+    </label>
+  </div>
   <div>Points without valid bounds remain unchanged. Daily profiles show original observations.</div>
 """ if has_count_bounds else "")
+        controls = controls.replace("__CONSTRUCTION_CONTROL__", (
+            '<label class="counts-checkbox-row"><input id="counts-show-construction" type="checkbox" '
+            + ('checked' if show_construction else '')
+            + '> Show construction-affected counts</label>'
+            '<div>Map display only; does not change calibration targets or saved statistics.</div>'
+        ) if has_construction else "")
         style = """
 <style>
-#counts-map-controls {
+#counts-map-controls, #counts-point-details {
   position: absolute;
   z-index: 20;
   top: 12px;
   right: 12px;
   width: min(400px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  overflow-y: auto;
   box-sizing: border-box;
   padding: 12px;
   border-radius: 7px;
@@ -845,6 +934,46 @@ class Plotter:
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
   color: #222;
   font: 13px/1.35 Arial, sans-serif;
+}
+#counts-map-controls[hidden], #counts-point-details[hidden] { display: none; }
+#counts-point-details { width: min(560px, calc(100vw - 24px)); max-width: calc(100vw - 24px); overflow: hidden; padding-left: 18px; }
+#counts-details-content { max-height: calc(100vh - 145px); overflow: auto; }
+#counts-details-resize { position: absolute; left: 0; top: 0; bottom: 0; width: 8px; cursor: ew-resize; touch-action: none; z-index: 1; background: #3688bc22; }
+#counts-details-resize:hover, #counts-details-resize:focus-visible { background: #3688bc88; }
+.counts-checkbox-row { display: block; margin: 7px 0; }
+.counts-checkbox-row[hidden] { display: none; }
+.counts-mode-row { display: flex; align-items: center; gap: 8px; margin: 12px 0 6px; }
+.counts-mode-switch { position: relative; flex: 1; cursor: pointer; }
+.counts-mode-switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.counts-mode-options { display: flex; position: relative; isolation: isolate; border-radius: 18px; background: #e7edf2; padding: 3px; }
+.counts-mode-options::before { content: ""; position: absolute; top: 3px; bottom: 3px; left: 3px; width: calc(50% - 3px); background: #fff; border-radius: 15px; box-shadow: 0 1px 4px #0003; z-index: -1; transition: transform .2s; }
+.counts-mode-options > span { flex: 1; text-align: center; padding: 5px 0; }
+.counts-mode-switch input:checked + .counts-mode-options::before { transform: translateX(100%); }
+.counts-mode-switch input:focus-visible + .counts-mode-options { outline: 2px solid #3688bc; }
+#counts-map-controls summary { cursor: pointer; font-weight: 700; }
+.counts-settings-body { margin-top: 12px; }
+.counts-filter-parameters {
+  display: grid;
+  grid-template-rows: 0fr;
+  visibility: hidden;
+  transition: grid-template-rows 0.2s ease, visibility 0.2s;
+}
+.counts-filter-parameters > div { min-height: 0; overflow: hidden; }
+.counts-filter-parameters.expanded { grid-template-rows: 1fr; visibility: visible; }
+#counts-point-details table { width: 100%; overflow-wrap: anywhere; }
+#counts-point-details td { vertical-align: top; padding: 3px; }
+#counts-point-details td:first-child:not([colspan]) { width: 55%; white-space: nowrap; padding-right: 12px; overflow-wrap: normal; }
+#counts-point-details svg { width: 100%; max-width: 100%; height: auto; }
+@media (max-width: 560px) {
+  #counts-point-details td:first-child:not([colspan]) { white-space: normal; }
+}
+#counts-details-close { cursor: pointer; padding: 6px 10px; }
+.counts-stat { display: flex; align-items: center; gap: 8px; }
+.counts-stat-track { flex: 1; min-width: 60px; height: 8px; border-radius: 5px; background: #e7edf2; overflow: hidden; }
+.counts-stat-track > div { height: 100%; border-radius: 5px; background: #3688bc; }
+.counts-stat span { min-width: 45px; text-align: right; font-variant-numeric: tabular-nums; }
+@media (prefers-reduced-motion: reduce) {
+  .counts-filter-parameters { transition: none; }
 }
 #counts-map-controls .counts-control-title {
   margin-bottom: 8px;
@@ -925,6 +1054,19 @@ class Plotter:
   const metricSettings = __METRIC_SETTINGS__;
   const select = document.getElementById("counts-color-metric");
   const countMode = document.getElementById("counts-count-mode");
+  const constructionToggle = document.getElementById("counts-show-construction");
+  const filterEnabled = document.getElementById("counts-filter-enabled");
+  const filterMetric = document.getElementById("counts-filter-metric");
+  const filterSign = document.getElementById("counts-filter-sign");
+  const filterValue = document.getElementById("counts-filter-value");
+  const filterError = document.getElementById("counts-filter-error");
+  const filterParameters = document.getElementById("counts-filter-parameters");
+  const settingsPanel = document.getElementById("counts-map-controls");
+  const detailsPanel = document.getElementById("counts-point-details");
+  const detailsContent = document.getElementById("counts-details-content");
+  const detailsClose = document.getElementById("counts-details-close");
+  const showConnectors = document.getElementById("counts-show-connectors");
+  let selectedPointId = null;
   const lowerInput = document.getElementById("counts-lower-bound");
   const upperInput = document.getElementById("counts-upper-bound");
   const lowerLabel = document.getElementById("counts-lower-label");
@@ -941,6 +1083,89 @@ class Plotter:
   const deck = typeof deckInstance === "undefined" ? null : deckInstance;
   const bounds = JSON.parse(JSON.stringify(metricSettings));
   const qualityBounds = JSON.parse(JSON.stringify(metricSettings));
+  const resizeHandle = document.getElementById("counts-details-resize");
+  let resizeStart = null;
+  function resizeDetails(width) {
+    const maximum = Math.max(0, window.innerWidth - 24);
+    detailsPanel.style.width = Math.min(maximum, Math.max(Math.min(360, maximum), width)) + "px";
+  }
+  resizeHandle.addEventListener("pointerdown", function (event) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    resizeStart = {x: event.clientX, width: detailsPanel.getBoundingClientRect().width};
+    resizeHandle.setPointerCapture(event.pointerId);
+  });
+  resizeHandle.addEventListener("pointermove", function (event) {
+    if (!resizeStart) return;
+    event.preventDefault();
+    event.stopPropagation();
+    resizeDetails(resizeStart.width + resizeStart.x - event.clientX);
+  });
+  function finishResize(event) {
+    resizeStart = null;
+    if (resizeHandle.hasPointerCapture(event.pointerId)) resizeHandle.releasePointerCapture(event.pointerId);
+  }
+  resizeHandle.addEventListener("pointerup", finishResize);
+  resizeHandle.addEventListener("pointercancel", finishResize);
+  resizeHandle.addEventListener("lostpointercapture", function () { resizeStart = null; });
+  resizeHandle.addEventListener("keydown", function (event) {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    resizeDetails(detailsPanel.getBoundingClientRect().width + (event.key === "ArrowLeft" ? 40 : -40));
+  });
+  detailsClose.addEventListener("click", function () {
+    selectedPointId = null;
+    updateMatchOverlays();
+    detailsPanel.hidden = true;
+    detailsContent.innerHTML = "";
+    settingsPanel.hidden = false;
+    settingsPanel.open = true;
+  });
+  if (deck) {
+    deck.setProps({onClick: function (info) {
+      if (!info.object || !info.layer ||
+          !(info.layer.id.startsWith("counts-points-") || info.layer.id.startsWith("counts-quality-"))) return;
+      // HTML is escaped/generated in Python, not taken from arbitrary station markup.
+      detailsContent.innerHTML = info.object._details_html || info.object._tooltip_html || "";
+      selectedPointId = info.object.id;
+      updateMatchOverlays();
+      settingsPanel.open = false;
+      settingsPanel.hidden = true;
+      detailsPanel.hidden = false;
+      detailsPanel.scrollTop = 0;
+    }});
+  }
+  // Keep unfiltered records so every control change can restore hidden points.
+  const pointData = new Map();
+  if (deck && deck.props && deck.props.layers) {
+    deck.props.layers.forEach(function (layer) {
+      if (layer.id.startsWith("counts-points-") || layer.id.startsWith("counts-quality-")) {
+        pointData.set(layer.id, layer.props.data);
+      }
+    });
+  }
+
+  function updateMatchOverlays() {
+    if (!deck || !deck.props || !deck.props.layers) return;
+    const points = deck.props.layers.filter(function (layer) {
+      return layer.id.startsWith("counts-points-") && layer.props.visible !== false;
+    }).flatMap(function (layer) { return layer.props.data; });
+    const selected = points.find(function (point) { return point.id === selectedPointId; });
+    const connectors = showConnectors.checked ? points.flatMap(function (point) {
+      return (point._connector_paths || []).map(function (path) { return {path: path}; });
+    }) : [];
+    deck.setProps({layers: deck.props.layers.map(function (layer) {
+      if (layer.id === "counts-match-connectors") return layer.clone({data: connectors});
+      if (layer.id === "counts-selected-link") return layer.clone({data: selected
+        ? (selected._matched_paths || []).map(function (path) { return {path: path}; }) : []});
+      if (layer.id === "counts-selected-point") return layer.clone({data: selected ? [selected] : []});
+      return layer;
+    })});
+  }
+  document.getElementById("counts-connectors-control").hidden = !Array.from(pointData.values())
+    .some(function (data) { return data.some(function (point) { return point._matched_paths; }); });
+  showConnectors.addEventListener("change", updateMatchOverlays);
 
   function addOption(target, key, label) {
     const option = document.createElement("option");
@@ -951,6 +1176,9 @@ class Plotter:
 
   Object.keys(metricSettings).forEach(function (key) {
     addOption(select, key, metricSettings[key].label);
+  });
+  ["geh", "adiff", "pdiff"].forEach(function (key) {
+    if (metricSettings[key]) addOption(filterMetric, key, metricSettings[key].label);
   });
   Object.keys(metricSettings).forEach(function (key) {
     const setting = metricSettings[key];
@@ -1084,24 +1312,52 @@ class Plotter:
     deck.setProps({layers: layers});
   }
 
-  if (countMode) {
-    countMode.addEventListener("change", function () {
+  if (constructionToggle) {
+    constructionToggle.addEventListener("change", function () {
+      if (!deck || !deck.props || !deck.props.layers) return;
+      deck.setProps({layers: deck.props.layers.map(function (layer) {
+        return layer.id.endsWith("-construction")
+          ? layer.clone({visible: constructionToggle.checked}) : layer;
+      })});
+      updateMatchOverlays();
+    });
+  }
+
+  function updatePointData() {
+      filterParameters.classList.toggle("expanded", filterEnabled.checked);
+      filterParameters.inert = !filterEnabled.checked;
+      [filterMetric, filterSign, filterValue].forEach(function (input) {
+        input.disabled = !filterEnabled.checked;
+      });
+      const threshold = Number(filterValue.value);
+      const valid = filterValue.value.trim() !== "" && Number.isFinite(threshold);
+      filterError.style.display = filterEnabled.checked && !valid ? "block" : "none";
+      if (filterEnabled.checked && !valid) return;
       if (!deck || !deck.props || !deck.props.layers) return;
       const layers = deck.props.layers.map(function (layer) {
-        if (!layer.id.startsWith("counts-points-") && !layer.id.startsWith("counts-quality-")) {
-          return layer;
-        }
-        return layer.clone({data: layer.props.data.map(function (datum) {
-          const state = countMode.value === "closest"
+        if (!pointData.has(layer.id)) return layer;
+        const data = pointData.get(layer.id).map(function (datum) {
+          const state = countMode && countMode.checked
             ? (datum._closest_count || datum._original_count) : datum._original_count;
           return state ? Object.assign({}, datum, state) : datum;
-        })});
+        }).filter(function (datum) {
+          if (!filterEnabled.checked) return true;
+          const value = datum[filterMetric.value];
+          if (value === null || value === undefined || value === "" || !Number.isFinite(Number(value))) return false;
+          return filterSign.value === "higher" ? Number(value) > threshold : Number(value) < threshold;
+        });
+        return layer.clone({data: data});
       });
       deck.setProps({layers: layers});
       recolor();
       updateQualityMarkers();
-    });
+      updateMatchOverlays();
   }
+  if (countMode) countMode.addEventListener("change", updatePointData);
+  filterEnabled.addEventListener("change", updatePointData);
+  filterMetric.addEventListener("change", updatePointData);
+  filterSign.addEventListener("change", updatePointData);
+  filterValue.addEventListener("input", updatePointData);
 
   select.addEventListener("change", function () {
     activeMetric = select.value;
@@ -1182,7 +1438,8 @@ class Plotter:
                    path_to_save=None, 
                    cut_network = False,
                    path_color_column=None,
-                   path_color_legend=None):
+                   path_color_legend=None,
+                   show_construction=True):
         
         point_data_to_show = point_data_to_show or []
 
@@ -1194,6 +1451,22 @@ class Plotter:
         if not isinstance(df, list):
             df = [df]
 
+        # Separate layers let deck.gl hide affected points (including picking
+        # and accuracy centers) without discarding their data or count modes.
+        split_points = []
+        has_construction = False
+        for points in point_gdf:
+            if points is not None and "construction_affected" in points:
+                affected = points.construction_affected.fillna(False).astype(bool)
+                has_construction |= bool(affected.any())
+                split_points.extend([points[~affected].copy(), points[affected].copy()])
+            else:
+                split_points.append(points)
+        point_gdf = split_points
+        if has_construction:
+            point_data_to_show = list(dict.fromkeys([
+                *point_data_to_show, "construction_affected", "construction_reason"
+            ]))
         metric_settings = Plotter._flow_metric_settings(point_gdf)
 
         # cut df to point gdf (just plot the regional network
@@ -1267,7 +1540,10 @@ class Plotter:
         if point_gdf:
             colors = [[255, 0, 0], [0, 102, 51], [128, 0, 128]]
             for i, gdf in enumerate(point_gdf):
-                if not gdf.empty:
+                if gdf is not None and not gdf.empty:
+                    affected_layer = "construction_affected" in gdf and bool(gdf.construction_affected.all())
+                    layer_key = f"{i}-construction" if affected_layer else str(i)
+                    visible = show_construction or not affected_layer
                     gdf = gdf.copy().reset_index(drop=True)
                     gdf["coordinates"] = gdf.geometry.apply(
                         lambda geometry: [geometry.x, geometry.y]
@@ -1280,18 +1556,23 @@ class Plotter:
                             )
                         )
 
-                    gdf["_tooltip_html"] = gdf.apply(
+                    gdf["_details_html"] = gdf.apply(
                         lambda row: Plotter._build_tooltip_html(row, point_data_to_show), axis=1
+                    )
+                    hover_fields = FLOW_MAP_TOOLTIP_FIELDS if "geh" in gdf else point_data_to_show
+                    gdf["_tooltip_html"] = gdf.apply(
+                        lambda row: Plotter._build_tooltip_html(row, hover_fields), axis=1
                     )
                     gdf, layer_has_bounds = Plotter._prepare_count_modes(gdf, point_data_to_show)
                     has_count_bounds |= layer_has_bounds
                     point_layer = pdk.Layer(
                         "ScatterplotLayer",
                         gdf,
-                        id=f"counts-points-{i}",
+                        id=f"counts-points-{layer_key}",
+                        visible=visible,
                         pickable=True,
                         get_position="coordinates",
-                        get_fill_color="color" if "color" in gdf else colors[i],
+                        get_fill_color="color" if "color" in gdf else colors[i % len(colors)],
                         get_radius=2,
                         radius_min_pixels=6,
                     )
@@ -1314,7 +1595,8 @@ class Plotter:
                             pdk.Layer(
                                 "ScatterplotLayer",
                                 gdf,
-                                id=f"counts-quality-green-{i}",
+                                id=f"counts-quality-green-{layer_key}",
+                                visible=visible,
                                 pickable=False,
                                 get_position="coordinates",
                                 get_fill_color="quality_green_color",
@@ -1327,7 +1609,8 @@ class Plotter:
                             pdk.Layer(
                                 "ScatterplotLayer",
                                 gdf,
-                                id=f"counts-quality-gold-{i}",
+                                id=f"counts-quality-gold-{layer_key}",
+                                visible=visible,
                                 pickable=False,
                                 get_position="coordinates",
                                 get_fill_color="quality_gold_color",
@@ -1350,6 +1633,17 @@ class Plotter:
                                         pickable=False)
             layers.append(polygon_layer)
             
+        if any(points is not None and "_matched_paths" in points for points in point_gdf):
+            layers.extend([
+                pdk.Layer("PathLayer", [], id="counts-match-connectors", get_path="path",
+                          get_color=[220, 35, 45, 220], width_min_pixels=1.5, pickable=False),
+                pdk.Layer("PathLayer", [], id="counts-selected-link", get_path="path",
+                          get_color=[255, 140, 0, 255], width_min_pixels=6, pickable=False),
+                pdk.Layer("ScatterplotLayer", [], id="counts-selected-point", get_position="coordinates",
+                          filled=False, stroked=True, get_line_color=[255, 140, 0, 255],
+                          line_width_min_pixels=3, radius_min_pixels=11, pickable=False),
+            ])
+
         # Calculate the view center from all real vertices in the first layer.
         coordinates = [coordinate for path in df[0].path for coordinate in path]
         mean_x = np.mean([coordinate[0] for coordinate in coordinates])
@@ -1379,7 +1673,8 @@ class Plotter:
         # Save the map as an HTML file and add browser-side controls.
         if path_to_save:
             r.to_html(path_to_save, notebook_display=False)
-            Plotter._inject_flow_metric_controls(path_to_save, metric_settings, has_count_bounds)
+            Plotter._inject_flow_metric_controls(path_to_save, metric_settings, has_count_bounds,
+                                                has_construction, show_construction)
             Plotter._inject_path_color_legend(path_to_save, path_color_legend)
             logger.info(f"Map saved to {path_to_save}")
         else:

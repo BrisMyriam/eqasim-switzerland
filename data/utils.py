@@ -67,7 +67,8 @@ def assign_household_class(df):
     df["household_size_class"] = np.minimum(5, df["household_size"]) - 1
 
 
-def prepare_education_locations(df_persons, df_statent, c):
+def prepare_education_locations(df_persons, df_statent, c, df_compatibility=None):
+    """Build classified study pools and explicit legacy age-based fallback pools."""
 
     census = c.census
 
@@ -77,16 +78,37 @@ def prepare_education_locations(df_persons, df_statent, c):
     education_types   = None 
 
     if census == "statpop":
+        required = {"current_education", "education_destination_status", "is_student"}
+        classified = pd.Series(False, index=df_persons.index)
+        if required.issubset(df_persons.columns) and df_compatibility is not None:
+            codes = df_persons["current_education"]
+            pooled = df_persons.get("study_level", pd.Series("", index=df_persons.index)).eq("tertiary")
+            classified = (df_persons["is_student"].eq(1) & df_persons["age"].ge(15)
+                          & (codes.isin(range(2, 14)) | pooled)
+                          & df_persons["education_destination_status"].isin(["domestic", "unknown"])).fillna(False)
+            filters_persons.append(classified & codes.isin(range(2, 9)))
+            filters_locations.append(df_statent["education_type"].eq("secondary"))
+            education_types = ["classified_secondary"]
+            query_sizes = [7]
+            ids = df_compatibility["enterprise_id"].unique()
+            filters_persons.append(classified & (pooled | codes.isin(range(9, 14))))
+            filters_locations.append(df_statent["enterprise_id"].isin(ids))
+            education_types.append("tertiary")
+            query_sizes.append(20)
+        else:
+            education_types, query_sizes = [], []
         age_bounds      = [(-np.inf, 6), (6, 12), (12, 16), (16, np.inf)]
-        education_types = ["kindergarten", "primary", "secondary", "tertiary"]
-        query_sizes     = (1, 2, 7, 20)
+        age_types = ["kindergarten", "primary", "secondary", "tertiary"]
+        age_queries = (1, 2, 7, 20)
 
-        for (lower_bound, upper_bound), type in zip(age_bounds, education_types):
-            filter_persons  = (df_persons["age"] > lower_bound) & (df_persons["age"] <= upper_bound)
+        for (lower_bound, upper_bound), type, query_size in zip(age_bounds, age_types, age_queries):
+            filter_persons  = ~classified & (df_persons["age"] > lower_bound) & (df_persons["age"] <= upper_bound)
             filter_location = df_statent["education_type"] == type
 
             filters_persons.append(filter_persons)
             filters_locations.append(filter_location)
+            education_types.append("age_" + type)
+            query_sizes.append(query_size)
 
     elif census == "are_synpop":
         query_sizes     = (1, 5, 20)
@@ -136,3 +158,16 @@ def read_csv(context, fp, fields, renames=None, sep=";", total=None, encoding="l
     ]
 
     return pd.DataFrame.from_records(data, columns=columns)
+
+
+def binary_code_series(values, *, name=None):
+    """Return numeric 0/1 codes, accepting legacy numeric strings and rejecting missing/invalid values."""
+    series = values if isinstance(values, pd.Series) else pd.Series(values)
+    field = name or series.name or "binary code"
+    try:
+        numeric = pd.to_numeric(series, errors="raise")
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must contain only 0 or 1") from error
+    if not numeric.isin([0, 1]).all():
+        raise ValueError(f"{field} must contain only nonmissing 0 or 1")
+    return numeric.astype("int8")

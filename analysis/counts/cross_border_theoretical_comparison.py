@@ -3,7 +3,7 @@ Stage: analysis.counts.cross_border_theoretical_comparison
 
 One counts_on_network_{city}.html-style map per extent (Switzerland/Geneva/
 Annemasse, via analysis.counts.runs.ch/.geneva/.annemasse), with
-crossborder_share_pct (from analysis.counts.cross_border_flow) added as a
+crossborder_share_pct (from analysis.counts.cross_border_flow_cars) added as a
 selectable point-color metric alongside pdiff/adiff/geh. "Theoretical" means
 the real, non-MATSim count-station data already used in analysis/counts, not
 the A+GQPV survey data in data/cross_border.
@@ -45,10 +45,10 @@ CROSSBORDER_TOOLTIP_FIELDS = ["crossborder_share_pct"]
 
 def configure(context):
     context.stage("analysis.counts.matching.network")
-    context.stage("analysis.counts.cross_border_flow")
+    context.stage("analysis.counts.cross_border_flow_cars")
     context.stage("data.spatial.swiss_border")
     configure_simulation_path(context)
-    context.config("only_weekday", default=False)
+    context.config("only_weekday", default=True)
 
     for run_name in CITY_RUNS.values():
         context.stage(f"analysis.counts.runs.{run_name}")
@@ -60,7 +60,7 @@ def execute(context):
 
     network = context.stage("analysis.counts.matching.network")
 
-    daily_csv = context.stage("analysis.counts.cross_border_flow")["daily_csv"]
+    daily_csv = context.stage("analysis.counts.cross_border_flow_cars")["daily_csv"]
     df_cb = pd.read_csv(daily_csv, dtype={"link_id": str})
     total_flow_by_link = dict(zip(df_cb.link_id, df_cb.total_flow))
     crossborder_flow_by_link = dict(zip(df_cb.link_id, df_cb.crossborder_flow))
@@ -101,7 +101,7 @@ def attach_crossborder_share(df_stations, network, total_flow_by_link, crossbord
 
     exploded = df_stations[["id", "link_id"]].explode("link_id")
     exploded["link_id"] = exploded["link_id"].astype(str)
-    exploded["sim_link"] = network.get_in_simulation_links(exploded["link_id"].tolist())
+    exploded["sim_link"] = exploded["link_id"]
 
     exploded["matsim_car_flow"] = exploded["sim_link"].map(total_flow_by_link).fillna(0.0)
     exploded["matsim_crossborder_flow"] = exploded["sim_link"].map(crossborder_flow_by_link).fillna(0.0)
@@ -132,7 +132,7 @@ def build_comparison_map(df_stations, network, border, output_path):
     df_stations = gpd.GeoDataFrame(df_stations, geometry="geometry", crs="EPSG:2056")
 
     matched_ids = df_stations["link_id"].explode().dropna().astype(str).unique().tolist()
-    matched_links = network.get_link_geometries(matched_ids, expand_merged=True)
+    matched_links = network.get_link_geometries(matched_ids)
 
     point_gdf = Plotter.prepare_flow_map_points(df_stations, df_stations).to_crs(epsg=4326)
     point_gdf = point_gdf.merge(df_stations[["id", *CROSSBORDER_TOOLTIP_FIELDS]], on="id", how="left")

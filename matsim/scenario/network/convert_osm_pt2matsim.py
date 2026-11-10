@@ -1,22 +1,8 @@
 import matsim.runtime.pt2matsim as pt2matsim
 from lxml import etree
+from functools import partial
+from matsim.config import tools as config_tools
 
-DEFAULT_SPEEDS = {
-    "motorway": 120,
-    "motorway_link": 80,
-    "trunk": 100,
-    "trunk_link": 80,
-    "primary": 80,
-    "primary_link": 50,
-    "secondary": 50,
-    "secondary_link": 30,
-    "tertiary": 50,
-    "tertiary_link": 30,
-    "unclassified": 30,
-    "residential": 30,
-    "living_street": 20,
-}
-DEFAULT_SPEEDS = {k: round(v / 3.6,1) for k, v in DEFAULT_SPEEDS.items()}  # convert km/h to m/s
 
 def configure(context):
     context.stage("matsim.runtime.java")
@@ -30,6 +16,8 @@ def configure(context):
     context.config("pt2matsim.respectVehicleAccess", True)
     context.config("pt2matsim.allowPtRoutesOnPrivateRoads", True)
     context.config("pt2matsim.maxLinkLength", 1000.0)
+    context.config("pt2matsim.useOsmTurnArrows", True)
+    context.config("java_memory", "50G", volatile=True)
 
 
 def execute(context):
@@ -55,7 +43,7 @@ def execute(context):
     # ------------------------------------------------------------------
     # Parse XML properly instead of hacking strings
     # ------------------------------------------------------------------
-    tree = etree.parse(template_path)
+    tree = config_tools.read_config(template_path)
     root = tree.getroot()
 
     # Find the OsmConverter module unambiguously
@@ -65,35 +53,25 @@ def execute(context):
     osm_module = modules[0]
 
     # --- small helpers -------------------------------------------------
-    def get_param(name, parent=osm_module):
-        """Return a <param> element or None."""
-        return parent.find(f'param[@name="{name}"]')
-
-    def set_param(name, value, parent=osm_module):
-        """Set a <param> value, creating it if missing."""
-        param = get_param(name, parent)
-        if param is None:
-            param = etree.SubElement(parent, "param", name=name, value=str(value))
-        else:
-            param.set("value", str(value))
+    get_param = partial(config_tools.get_param, parent=osm_module)
+    set_param = partial(config_tools.set_param, parent=osm_module)
 
     # --- 1. Fix bus subnetwork ----------------------------------------
     for subnet in osm_module.xpath('parameterset[@type="routableSubnetwork"]'):
-        allowed = get_param("allowedTransportModes", subnet)
+        allowed = get_param("allowedTransportModes", parent=subnet)
         if allowed is not None and allowed.get("value") == "bus, car":
-            allowed.set("value", "bus")
+            config_tools.set_param("allowedTransportModes", "bus", subnet)
 
     # --- 2. Add taxi & bus to all road wayDefaultParams ---------------
     for way in osm_module.xpath('parameterset[@type="wayDefaultParams"]'):
-        allowed = get_param("allowedTransportModes", way)
+        allowed = get_param("allowedTransportModes", parent=way)
         if allowed is not None and allowed.get("value") == "car":
-            allowed.set("value", "car,taxi,bus")
-            highway = get_param("osmValue", way)
+            config_tools.set_param("allowedTransportModes", "car,taxi,bus", way)
+            highway = get_param("osmValue", parent=way)
             if highway is not None:
                 freespeed = DEFAULT_SPEEDS.get(highway.get('value'))
                 if freespeed is not None:
-                    way_speed = get_param("freespeed", way)
-                    way_speed.set("value", str(freespeed))
+                    config_tools.set_param("freespeed", freespeed, way)
 
     # --- 3.1 Set scalar parameters -------------------------------------
     set_param("osmFile", network_file)
@@ -103,6 +81,7 @@ def execute(context):
     set_param("parseTurnRestrictions", str(context.config("parseTurnRestrictions")).lower())
     set_param("respectVehicleAccess", str(context.config("pt2matsim.respectVehicleAccess")).lower())
     set_param("allowPtRoutesOnPrivateRoads", str(context.config("pt2matsim.allowPtRoutesOnPrivateRoads")).lower())
+    set_param("useOsmTurnArrows", str(context.config("pt2matsim.useOsmTurnArrows")).lower())
 
     if export_detailed_network:
         set_param("outputDetailedLinkGeometryFile", detailed_network_file)
@@ -114,19 +93,13 @@ def execute(context):
     ]
 
     for sn in new_subnetworks:
-        ps = etree.SubElement(osm_module, "parameterset", type="routableSubnetwork")
-        etree.SubElement(ps, "param", name="allowedTransportModes", value=sn["allowedTransportModes"])
-        etree.SubElement(ps, "param", name="subnetworkMode", value=sn["subnetworkMode"])
+        ps = config_tools.get_parameter_set(osm_module, "routableSubnetwork",
+                                             {"subnetworkMode": sn["subnetworkMode"]})
+        config_tools.set_param("allowedTransportModes", sn["allowedTransportModes"], ps)
 
     # --- 5. Write back, preserving XML declaration + DOCTYPE ----------
     etree.indent(tree, space="    ")
-    tree.write(
-        output_path,
-        xml_declaration=True,
-        encoding="UTF-8",
-        pretty_print=True,
-        doctype=tree.docinfo.doctype,  # keeps <!DOCTYPE config SYSTEM "...">
-    )
+    config_tools.write_config(tree, output_path)
 
     # Run conversion
     pt2matsim.run(
@@ -138,3 +111,29 @@ def execute(context):
 
     network_path = "%s/converted_network.xml.gz" % context.path()
     return network_path, detailed_network_file
+
+
+
+
+
+
+
+
+
+################ defaults and options ##################
+DEFAULT_SPEEDS = {
+    "motorway": 120,
+    "motorway_link": 80,
+    "trunk": 100,
+    "trunk_link": 80,
+    "primary": 80,
+    "primary_link": 50,
+    "secondary": 50,
+    "secondary_link": 30,
+    "tertiary": 50,
+    "tertiary_link": 30,
+    "unclassified": 30,
+    "residential": 30,
+    "living_street": 20,
+}
+DEFAULT_SPEEDS = {k: round(v / 3.6,1) for k, v in DEFAULT_SPEEDS.items()}  # convert km/h to m/s

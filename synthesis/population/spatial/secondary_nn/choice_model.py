@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import os, json
+from .distribution_scores import discrete_crps, projected_energy_score, relative_mean_distance_loss, PreparedCRPS
+from .cross_validation import train_cross_validated, train_rotating_holdout
 import matplotlib.pyplot as plt
 logger = logging.getLogger("synpp: choice_model")
 
@@ -111,7 +113,13 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
                        restore_best_weights=False,
                        distance_candidates=None, distance_targets=None,
                        distance_candidates_home=None, distance_targets_home=None,
-                       distance_loss_weight=0.0, distance_loss_short_floor_m=100.0):
+                       distance_loss_weight=0.0, distance_loss_short_floor_m=100.0,
+                       distance_loss_kind="relative", distribution_scale_m=1000.0,
+                       candidate_xy=None, observed_xy=None, energy_projections=8,
+                       refit_full=False, auxiliary_relative_distance_loss_weight=0.0,
+                       early_stopping_min_epochs=0, cross_validate=False, validation_seed=None,
+                       relative_distance_underestimation_factor=1.0, rotating_holdout=False,
+                       validation_rotation_epochs=3, validation_holdout_fraction=0.1):
     """Train the choice model with rotating or fixed-fold validation.
 
     ``validation_groups`` keeps related samples (for example, trips belonging to
@@ -120,6 +128,15 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
 
     If ``path`` is given, loss history is saved to ``path/loss_history.json``
     and a plot to ``path/lossevolution.png``.
+
+    ``auxiliary_relative_distance_loss_weight`` adds the legacy expected-trip-
+    distance penalty alongside distribution scoring, with its own coefficient.
+
+    ``cross_validate`` fits independent person-fold models to select an epoch
+    count, then refits the original model on all supplied rows. The minimum
+    epoch setting delays stopping, while an earlier best epoch remains eligible.
+    ``relative_distance_underestimation_factor`` multiplies underestimation of
+    the origin radius only; the home-radius penalty remains symmetric.
     """
 
     lr_step_size = int(np.clip(lr_step_size, max(1, epochs // 6), max(1, epochs // 3)))
@@ -133,17 +150,29 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
     person_dynamic_tensor   = torch.as_tensor(person_dynamic_x,   dtype=torch.float32, device=device)
     candidate_static_tensor = torch.as_tensor(candidate_static_x, dtype=torch.float32, device=device)
     candidate_dynamic_tensor= torch.as_tensor(candidate_dynamic_x,dtype=torch.float32, device=device)
-    y_tensor      = torch.as_tensor(y,          dtype=torch.long,  device=device)
+    y_tensor      = torch.tensor(y,             dtype=torch.long,  device=device)
     mask_tensor   = torch.as_tensor(valid_mask, dtype=torch.bool,  device=device)
     weights_tensor = (torch.as_tensor(weights, dtype=torch.float32, device=device)
                       if weights is not None
                       else torch.ones(person_static_tensor.shape[0], device=device))
 
+    auxiliary_weight = float(auxiliary_relative_distance_loss_weight)
+    underestimation_factor = float(relative_distance_underestimation_factor)
+    if not np.isfinite(underestimation_factor) or underestimation_factor < 1:
+        raise ValueError("Relative-distance underestimation factor must be finite and at least one")
+    if underestimation_factor != 1 and distance_loss_kind != "relative":
+        raise ValueError("Asymmetric radius scoring requires the relative-distance loss")
+    if not np.isfinite(auxiliary_weight) or auxiliary_weight < 0:
+        raise ValueError("Auxiliary relative-distance loss weight must be finite and nonnegative")
+    if auxiliary_weight > 0 and distance_loss_kind != "crps_energy":
+        raise ValueError("Auxiliary relative-distance scoring requires the distribution loss")
     use_distance_last_loss = (
-        float(distance_loss_weight) > 0.0
+        (float(distance_loss_weight) > 0.0 or auxiliary_weight > 0.0)
         and distance_candidates is not None
         and distance_targets is not None
     )
+    if underestimation_factor != 1 and not use_distance_last_loss:
+        raise ValueError("Asymmetric relative scoring requires origin distances, targets and a positive loss weight")
     use_distance_home_loss = (
         float(distance_loss_weight) > 0.0
         and distance_candidates_home is not None
@@ -163,6 +192,13 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
     else:
         distance_candidates_tensor = None
         distance_targets_tensor = None
+    if auxiliary_weight > 0:
+        if distance_candidates_tensor is None:
+            raise ValueError("Auxiliary relative-distance scoring requires origin-distance tensors")
+        if distance_candidates_tensor.shape != mask_tensor.shape:
+            raise ValueError("Auxiliary origin distances must align with candidate masks")
+        if not torch.isfinite(distance_candidates_tensor).all() or not torch.isfinite(distance_targets_tensor).all():
+            raise ValueError("Auxiliary origin distances and targets must be finite")
     if use_distance_home_loss:
         distance_candidates_home_tensor = torch.as_tensor(distance_candidates_home, dtype=torch.float32, device=device)
         distance_targets_home_tensor = torch.as_tensor(distance_targets_home, dtype=torch.float32, device=device)
@@ -179,6 +215,75 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
         distance_targets_home_tensor = None
     short_floor = float(max(1e-6, distance_loss_short_floor_m))
 
+    # Score destination distributions on fixed physical scales.
+
+    if distance_loss_kind not in ("relative", "crps_energy") or distribution_scale_m <= 0 or distance_loss_weight < 0:
+        raise ValueError("Invalid distance distribution loss settings")
+    spatial_candidates = spatial_targets = None
+    if distance_loss_kind == "crps_energy":
+        if candidate_xy is None or observed_xy is None or energy_projections < 2:
+            raise ValueError("Spatial distribution scoring requires coordinates and at least two projections")
+        spatial_candidates = torch.as_tensor(candidate_xy, dtype=torch.float32, device=device)
+        spatial_targets = torch.as_tensor(observed_xy, dtype=torch.float32, device=device)
+        if spatial_candidates.shape != (*mask_tensor.shape, 2) or spatial_targets.shape != (len(y_tensor), 2):
+            raise ValueError("Spatial distribution scores require aligned candidate and observed coordinates")
+        if not torch.isfinite(spatial_candidates).all() or not torch.isfinite(spatial_targets).all():
+            raise ValueError("Spatial distribution coordinates must be finite")
+
+    # Cache fixed scalar radii and projected geometry across all CV epochs and refitting.
+
+    prepared_scores = []
+    if distance_loss_kind == "crps_energy" and float(distance_loss_weight) > 0:
+        logger.info("Precomputing exact distribution-score geometry for all training folds")
+        for candidates, targets in [(distance_candidates_tensor, distance_targets_tensor),
+                                    (distance_candidates_home_tensor, distance_targets_home_tensor)]:
+            if candidates is not None:
+                prepared_scores.append((PreparedCRPS(candidates, targets), 1.))
+        if spatial_candidates is not None:
+            for angle in np.arange(energy_projections) * np.pi / energy_projections:
+                direction = spatial_candidates.new_tensor([np.cos(angle), np.sin(angle)])
+                # Center per trip to preserve the original projected-score numerics.
+                positions = ((spatial_candidates - spatial_targets[:, None, :]) @ direction)
+                prepared_scores.append((PreparedCRPS(positions, torch.zeros_like(spatial_targets[:, 0])),
+                                        np.pi / (2 * energy_projections)))
+        cache_bytes = sum(score.order.numel() * score.order.element_size()
+                          + score.values.numel() * score.values.element_size()
+                          + score.absolute.numel() * score.absolute.element_size()
+                          for score, _ in prepared_scores)
+        logger.info("Prepared distribution geometry: %.2f GiB", cache_bytes / 1024**3)
+
+    def regularization(indices, probabilities):
+        values = probabilities.new_zeros(len(indices))
+        if float(distance_loss_weight) == 0:
+            return values
+        if prepared_scores:
+            for prepared, factor in prepared_scores:
+                values = values + factor * prepared.score(probabilities, indices) / distribution_scale_m
+            return values
+        for candidates, targets, factor in [
+                (distance_candidates_tensor, distance_targets_tensor, underestimation_factor),
+                (distance_candidates_home_tensor, distance_targets_home_tensor, 1.)]:
+            if candidates is None:
+                continue
+            if distance_loss_kind == "relative":
+                values = values + relative_mean_distance_loss(
+                    probabilities, candidates[indices], targets[indices], short_floor,
+                    underestimation_factor=factor)
+            else:
+                values = values + discrete_crps(probabilities, candidates[indices], targets[indices]) / distribution_scale_m
+        if spatial_candidates is not None:
+            values = values + projected_energy_score(
+                probabilities, spatial_candidates[indices], spatial_targets[indices],
+                projections=energy_projections) / distribution_scale_m
+        return values
+
+    def auxiliary_scores(indices, probabilities):
+        return relative_mean_distance_loss(
+            probabilities, distance_candidates_tensor[indices],
+            distance_targets_tensor[indices], short_floor)
+
+    initial_state = {key: value.detach().clone() for key, value in model.state_dict().items()} if refit_full else None
+
     n_samples   = person_static_tensor.shape[0]
     n_val_folds = max(2, int(n_val_folds))
     val_every   = max(1, int(val_every))
@@ -191,11 +296,18 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
         if rotate_validation:
             raise ValueError("Early stopping requires rotate_validation=False")
     early_stopping_min_delta = max(0.0, float(early_stopping_min_delta))
+    min_epochs = int(early_stopping_min_epochs)
+    if min_epochs < 0 or min_epochs > int(epochs):
+        raise ValueError("Minimum training epochs must lie between zero and the maximum epochs")
+    if (cross_validate or rotating_holdout) and (validation_groups is None or rotate_validation):
+        raise ValueError("Independent CV requires person groups and rotate_validation=False")
 
     # Build folds once. With groups, split unique groups first so related
     # observations cannot leak between training and validation.
+    cv_seed = int(torch.initial_seed() if validation_seed is None else validation_seed)
+    permutation = np.random.default_rng(cv_seed).permutation if cross_validate or rotating_holdout else np.random.permutation
     if validation_groups is None:
-        perm = np.random.permutation(n_samples)
+        perm = permutation(n_samples)
         fold_arrays = np.array_split(perm, n_val_folds)
     else:
         validation_groups = np.asarray(validation_groups)
@@ -205,7 +317,7 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
         if len(unique_groups) < 2:
             raise ValueError("validation_groups must contain at least two distinct groups")
         n_val_folds = min(n_val_folds, len(unique_groups))
-        group_folds = np.array_split(np.random.permutation(unique_groups), n_val_folds)
+        group_folds = np.array_split(permutation(unique_groups), n_val_folds)
         fold_arrays = [np.flatnonzero(np.isin(validation_groups, groups)) for groups in group_folds]
 
     fold_indices = [
@@ -214,6 +326,40 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
     ]
     if any(len(indices) == 0 for indices in fold_indices):
         raise ValueError("Validation split produced an empty fold")
+
+    # Use the same masked and survey-weighted objective in each independent fold.
+
+    if cross_validate or rotating_holdout:
+        (logger_instance or logger).info(
+            "CV scoring: kind=%s, main_weight=%.4f, auxiliary_relative_weight=%.4f, origin_underestimation_factor=%.2f",
+            distance_loss_kind, distance_loss_weight, auxiliary_weight, underestimation_factor)
+        def score_samples(indices, utilities):
+            probabilities = torch.softmax(utilities, dim=1)
+            score = F.cross_entropy(utilities, y_tensor[indices], reduction="none")
+            score = score + float(distance_loss_weight) * regularization(indices, probabilities)
+            if auxiliary_weight > 0:
+                score = score + auxiliary_weight * auxiliary_scores(indices, probabilities)
+            return score
+
+        trainer = train_rotating_holdout if rotating_holdout else train_cross_validated
+        schedule = dict(rotation_epochs=validation_rotation_epochs,
+                        holdout_fraction=validation_holdout_fraction) if rotating_holdout else {}
+        trainer(
+            model, (person_static_tensor, person_dynamic_tensor, candidate_static_tensor,
+                    candidate_dynamic_tensor, mask_tensor, weights_tensor),
+            fold_indices, validation_groups, score_samples, **schedule, epochs=int(epochs),
+            batch_size=int(batch_size), lr=lr, weight_decay=weight_decay,
+            lr_step_size=lr_step_size, lr_gamma=lr_gamma, grad_clip=grad_clip,
+            patience=early_stopping_patience, min_delta=early_stopping_min_delta,
+            min_epochs=min_epochs, seed=cv_seed, logger=logger_instance or logger, path=path,
+            history_settings=dict(distance_loss_kind=distance_loss_kind,
+                distance_loss_weight=float(distance_loss_weight),
+                relative_distance_underestimation_factor=underestimation_factor,
+                auxiliary_relative_distance_loss_weight=auxiliary_weight,
+                distance_loss_short_floor_m=short_floor, distribution_scale_m=float(distribution_scale_m),
+                energy_projections=int(energy_projections), dropout_rate=model.dropout_rate,
+                weight_decay=float(weight_decay), restore_best_weights=bool(restore_best_weights)))
+        return
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size, gamma=lr_gamma)
@@ -231,7 +377,10 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
         validation_description, group_label, val_every,
     )
     if float(distance_loss_weight) > 0.0:
-        if use_distance_last_loss or use_distance_home_loss:
+        if distance_loss_kind == "crps_energy":
+            local_logger.info("Distribution scoring: weight=%.4f, fixed_scale_m=%.1f, spatial_projections=%s",
+                              distance_loss_weight, distribution_scale_m, energy_projections)
+        elif use_distance_last_loss or use_distance_home_loss:
             local_logger.info(
                 "\tDistance regularization enabled: weight=%.4f, short_floor_m=%.1f, use_last=%s, use_home=%s",
                 float(distance_loss_weight),
@@ -239,9 +388,14 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
                 str(use_distance_last_loss),
                 str(use_distance_home_loss),
             )
+            local_logger.info("Origin-radius underestimation multiplier: %.2f; home radius remains symmetric",
+                              underestimation_factor)
         else:
             local_logger.warning("\tDistance regularization requested but distance tensors were not provided; disabling it")
     t0 = time.time()
+    if auxiliary_weight > 0:
+        local_logger.info("Auxiliary expected-trip-distance Huber: weight=%.4f, floor_m=%.1f",
+                          auxiliary_weight, short_floor)
 
     train_losses: list[float] = []
     val_losses:   list[float] = []
@@ -288,50 +442,21 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
             weighted_ce_loss = ce_loss_per_sample * batch_w
             ce_loss = weighted_ce_loss.sum() / batch_w.sum().clamp_min(1e-12)
 
-            if use_distance_last_loss:
-                batch_dist_candidates = distance_candidates_tensor[idx]
-                batch_target_distance = distance_targets_tensor[idx]
-                probs = torch.softmax(utilities, dim=1)
-                expected_distance = (probs * batch_dist_candidates).sum(dim=1)
-                normalizer = torch.clamp(batch_target_distance + short_floor, min=short_floor)
-                relative_error = (expected_distance - batch_target_distance) / normalizer
-                distance_loss_per_sample = F.smooth_l1_loss(
-                    relative_error,
-                    torch.zeros_like(relative_error),
-                    reduction="none",
-                )
-                weighted_distance_loss = distance_loss_per_sample * batch_w
-                distance_last_loss = weighted_distance_loss.sum() / batch_w.sum().clamp_min(1e-12)
-            else:
-                distance_last_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
-
-            if use_distance_home_loss:
-                batch_dist_home_candidates = distance_candidates_home_tensor[idx]
-                batch_target_home_distance = distance_targets_home_tensor[idx]
-                probs = torch.softmax(utilities, dim=1)
-                expected_home_distance = (probs * batch_dist_home_candidates).sum(dim=1)
-                normalizer_home = torch.clamp(batch_target_home_distance + short_floor, min=short_floor)
-                relative_home_error = (expected_home_distance - batch_target_home_distance) / normalizer_home
-                home_loss_per_sample = F.smooth_l1_loss(
-                    relative_home_error,
-                    torch.zeros_like(relative_home_error),
-                    reduction="none",
-                )
-                weighted_home_loss = home_loss_per_sample * batch_w
-                distance_home_loss = weighted_home_loss.sum() / batch_w.sum().clamp_min(1e-12)
-            else:
-                distance_home_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
-
-            distance_loss = distance_last_loss + distance_home_loss
+            probabilities = torch.softmax(utilities, dim=1)
+            distribution_scores = regularization(idx, probabilities)
+            distance_loss = (distribution_scores * batch_w).sum() / batch_w.sum().clamp_min(1e-12)
 
             loss = ce_loss + float(distance_loss_weight) * distance_loss
+            if auxiliary_weight > 0:
+                auxiliary_loss = (auxiliary_scores(idx, probabilities) * batch_w).sum() / batch_w.sum().clamp_min(1e-12)
+                loss = loss + auxiliary_weight * auxiliary_loss
 
             loss.backward()
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
             optimizer.step()
 
-            total_weighted_loss += (ce_loss + float(distance_loss_weight) * distance_loss).item() * batch_w.sum().item()
+            total_weighted_loss += loss.item() * batch_w.sum().item()
             total_weight        += batch_w.sum().item()
 
         train_loss = total_weighted_loss / max(total_weight, 1e-12)
@@ -355,35 +480,15 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
                 v_utils = v_utils.masked_fill(~v_m, -1e9)
                 v_ce_loss = ((F.cross_entropy(v_utils, v_y, reduction="none") * v_w).sum()
                              / v_w.sum().clamp_min(1e-12))
-                if use_distance_last_loss:
-                    v_dist_candidates = distance_candidates_tensor[val_idx]
-                    v_target_distance = distance_targets_tensor[val_idx]
-                    v_probs = torch.softmax(v_utils, dim=1)
-                    v_expected_distance = (v_probs * v_dist_candidates).sum(dim=1)
-                    v_normalizer = torch.clamp(v_target_distance + short_floor, min=short_floor)
-                    v_relative_error = (v_expected_distance - v_target_distance) / v_normalizer
-                    v_distance_last_loss = (
-                        F.smooth_l1_loss(v_relative_error, torch.zeros_like(v_relative_error), reduction="none") * v_w
-                    ).sum() / v_w.sum().clamp_min(1e-12)
-                else:
-                    v_distance_last_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
+                v_probabilities = torch.softmax(v_utils, dim=1)
+                v_scores = regularization(val_idx, v_probabilities)
+                v_distance_loss = (v_scores * v_w).sum() / v_w.sum().clamp_min(1e-12)
 
-                if use_distance_home_loss:
-                    v_dist_home_candidates = distance_candidates_home_tensor[val_idx]
-                    v_target_home_distance = distance_targets_home_tensor[val_idx]
-                    v_probs = torch.softmax(v_utils, dim=1)
-                    v_expected_home_distance = (v_probs * v_dist_home_candidates).sum(dim=1)
-                    v_normalizer_home = torch.clamp(v_target_home_distance + short_floor, min=short_floor)
-                    v_relative_home_error = (v_expected_home_distance - v_target_home_distance) / v_normalizer_home
-                    v_distance_home_loss = (
-                        F.smooth_l1_loss(v_relative_home_error, torch.zeros_like(v_relative_home_error), reduction="none") * v_w
-                    ).sum() / v_w.sum().clamp_min(1e-12)
-                else:
-                    v_distance_home_loss = torch.tensor(0.0, dtype=torch.float32, device=device)
-
-                v_distance_loss = v_distance_last_loss + v_distance_home_loss
-
-                val_loss = float((v_ce_loss + float(distance_loss_weight) * v_distance_loss).item())
+                v_loss = v_ce_loss + float(distance_loss_weight) * v_distance_loss
+                if auxiliary_weight > 0:
+                    v_auxiliary_loss = (auxiliary_scores(val_idx, v_probabilities) * v_w).sum() / v_w.sum().clamp_min(1e-12)
+                    v_loss = v_loss + auxiliary_weight * v_auxiliary_loss
+                val_loss = float(v_loss.item())
 
             val_losses.append(val_loss)
             val_epochs.append(epoch + 1)
@@ -402,8 +507,10 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
                         name: value.detach().cpu().clone()
                         for name, value in model.state_dict().items()
                     }
-            elif not rotate_validation:
+            elif not rotate_validation and epoch + 1 > min_epochs:
                 checks_without_improvement += 1
+            elif not rotate_validation:
+                checks_without_improvement = 0
 
             local_logger.info(
                 "\tEpoch %s/%s | Train: %.4f | Val (fold %d): %.4f%s | Time: %.1fmin",
@@ -420,6 +527,7 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
 
         if (
             early_stopping_patience is not None
+            and epoch + 1 >= min_epochs
             and checks_without_improvement >= early_stopping_patience
         ):
             stopped_early = True
@@ -437,6 +545,38 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
             best_epoch, best_val_loss,
         )
 
+    # Refit on every supplied development person after selecting an epoch count.
+
+    refit_epochs = 0
+    if refit_full:
+        refit_epochs = best_epoch or len(train_losses)
+        model.load_state_dict(initial_state)
+        optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=lr_step_size, gamma=lr_gamma)
+        local_logger.info("Refitting %s epochs on all %s development rows", refit_epochs, n_samples)
+        for epoch in range(refit_epochs):
+            model.train()
+            order = torch.randperm(n_samples, device=device)
+            for start in range(0, n_samples, batch_size):
+                idx = order[start:start + batch_size]
+                static = candidate_static_tensor if candidate_static_tensor.shape[0] == 1 else candidate_static_tensor[idx]
+                utilities = model(person_static_tensor[idx], person_dynamic_tensor[idx], static, candidate_dynamic_tensor[idx])
+                utilities = utilities.masked_fill(~mask_tensor[idx], -1e9)
+                weight = weights_tensor[idx]
+                score = F.cross_entropy(utilities, y_tensor[idx], reduction="none")
+                probabilities = torch.softmax(utilities, dim=1)
+                score = score + float(distance_loss_weight) * regularization(idx, probabilities)
+                if auxiliary_weight > 0:
+                    score = score + auxiliary_weight * auxiliary_scores(idx, probabilities)
+                loss = (score * weight).sum() / weight.sum().clamp_min(1e-12)
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if grad_clip is not None and float(grad_clip) > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), float(grad_clip))
+                optimizer.step()
+            scheduler.step()
+        model.eval()
+
     # ── Save history & plot ───────────────────────────────────────────────────
     if path is not None:
         history = {
@@ -449,6 +589,7 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
             "validation_every": val_every,
             "early_stopping_patience": early_stopping_patience,
             "early_stopping_min_delta": early_stopping_min_delta,
+            "early_stopping_min_epochs": min_epochs,
             "restore_best_weights": restore_best_weights,
             "dropout_rate": model.dropout_rate,
             "weight_decay": float(weight_decay),
@@ -456,6 +597,14 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
             "best_val_loss": None if best_epoch is None else best_val_loss,
             "stopped_early": stopped_early,
             "epochs_completed": len(train_losses),
+            "refit_full": bool(refit_full), "refit_rows": n_samples if refit_full else 0,
+            "refit_epochs": refit_epochs, "distance_loss_kind": distance_loss_kind,
+            "distribution_scale_m": float(distribution_scale_m),
+            "energy_projections": int(energy_projections),
+            "distance_loss_weight": float(distance_loss_weight),
+            "relative_distance_underestimation_factor": underestimation_factor,
+            "auxiliary_relative_distance_loss_weight": auxiliary_weight,
+            "distance_loss_short_floor_m": short_floor,
         }
         with open(os.path.join(path, "loss_history.json"), "w") as f:
             json.dump(history, f, indent=2)
@@ -480,7 +629,8 @@ def train_choice_model(model, person_static_x, person_dynamic_x, candidate_stati
             local_logger.info("\tLoss plot saved to %s", os.path.join(path, "lossevolution.png"))
 
 
-def predict_choice_proba(model, person_static, person_dynamic, candidate_static, candidate_dynamic, valid_mask_tensor=None):
+def predict_choice_proba(model, person_static, person_dynamic, candidate_static, candidate_dynamic,
+                         valid_mask_tensor=None, candidate_weights=None):
     with torch.inference_mode():
         dev = model._device
         ps = torch.as_tensor(person_static,   dtype=torch.float32, device=dev)
@@ -488,9 +638,21 @@ def predict_choice_proba(model, person_static, person_dynamic, candidate_static,
         cs = torch.as_tensor(candidate_static,  dtype=torch.float32, device=dev)
         cd = torch.as_tensor(candidate_dynamic, dtype=torch.float32, device=dev)
         utilities = model(ps, pd, cs, cd)
+        if candidate_weights is not None:
+            weights = torch.as_tensor(candidate_weights, dtype=utilities.dtype, device=dev)
+            if weights.ndim == 1:
+                weights = weights.unsqueeze(0)
+            if weights.shape[-1] != utilities.shape[-1] or weights.ndim != 2 or weights.shape[0] not in (1, utilities.shape[0]):
+                raise ValueError("Soft destination weights must align with candidate utilities")
+            if not torch.isfinite(weights).all() or not (weights > 0).all():
+                raise ValueError("Soft destination weights must be finite and strictly positive")
+            # Multiplying choice masses is addition in log-utility space, regardless of utility sign.
+            utilities = utilities + weights.log()
         if valid_mask_tensor is not None:
             valid_mask_tensor = torch.as_tensor(valid_mask_tensor, dtype=torch.bool, device=dev)
             if valid_mask_tensor.ndim == 1:
                 valid_mask_tensor = valid_mask_tensor.unsqueeze(0).expand(utilities.shape[0], -1)
-            utilities.masked_fill_(~valid_mask_tensor, -1e9)
+            if not bool(valid_mask_tensor.any(dim=1).all().item()):
+                raise ValueError("Destination choice has no eligible candidates for at least one row")
+            utilities = utilities.masked_fill(~valid_mask_tensor, -torch.inf)
         return torch.softmax(utilities, dim=1)

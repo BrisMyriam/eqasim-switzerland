@@ -1,15 +1,22 @@
 import numpy as np
 import pandas as pd
 from .hierarchical_utils import encode_purpose
+from .chain_state import survey_chain_states
+from .tools import accessibility_at_points, encode_ovgk
 
 def configure(context):
+    context.stage("data.spatial.ovgk")
     context.stage("data.microcensus.persons")
-    context.stage("data.microcensus.trips")
+    context.stage("data.microcensus.secondary_trips")
 
 
 def execute(context):
+
+    # Load observed diaries and primary-location attributes.
+
     persons = context.stage("data.microcensus.persons")[["person_id", "home_x", "home_y", "work_x", "work_y"]]
-    trips = context.stage("data.microcensus.trips")[0].copy()
+    # Encode the same purpose grouping used by synthetic secondary visits.
+    trips = context.stage("data.microcensus.secondary_trips").copy()
 
     trips = trips.merge(persons, on="person_id", how="left")
 
@@ -79,6 +86,12 @@ def execute(context):
     _chain_series = trips_sorted.groupby("person_id", sort=False).apply(build_activity_chain)
     trips_sorted["activity_chain"] = trips_sorted["person_id"].map(_chain_series)
     
+    # Build remaining plan state using only known primary anchors.
+
+    trips_sorted["origin_ovgk"] = encode_ovgk(accessibility_at_points(
+        trips_sorted.origin_x, trips_sorted.origin_y, context.stage("data.spatial.ovgk")))
+    trips_sorted["chain_state"] = survey_chain_states(trips_sorted)
+
     # target distances
     trips_sorted["target_distance"] = trips_sorted["crowfly_distance"]
 
@@ -86,4 +99,4 @@ def execute(context):
                          "trip_destination_distance_from_home", "trip_destination_distance_from_work", 
                          "daily_longest_distance_from_home", "daily_longest_distance_from_work", "daily_crowfly_total", 
                          "crowfly_consumed_before_trip", "trip_position_class","departure_time_normalized", "activity_duration_h",
-                         "activity_chain", "trip_origin_distance_from_home", "target_distance"]]
+                         "activity_chain", "trip_origin_distance_from_home", "target_distance", "chain_state"]]

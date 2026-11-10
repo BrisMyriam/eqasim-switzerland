@@ -1,22 +1,22 @@
 import os
+from functools import partial
+from matsim.config import tools as config_tools
 import matsim.runtime.pt2matsim as pt2matsim
 
 
-def configure(context):    
+def configure(context):
     context.stage("matsim.runtime.java")
     context.stage("matsim.runtime.pt2matsim")
-    
+
     context.stage("matsim.scenario.network.convert_osm")
     context.stage("matsim.scenario.network.convert_pt_schedule")
-    
-    context.config("threads")
-    context.config("route_bike", True)
 
+    context.config("threads", volatile=True)
+    context.config("route_bike", True)
+    context.config("export_detailed_network", True)
+    context.config("java_memory", "50G", volatile=True)
 
 def execute(context):
-    # jar, tmp_path = context.stage("matsim.java.pt2matsim")
-    # java = context.stage("utils.java")
-
     unmapped_network_path = context.stage("matsim.scenario.network.convert_osm")
     unmapped_schedule_path = context.stage("matsim.scenario.network.convert_pt_schedule")["schedule"]
 
@@ -25,112 +25,7 @@ def execute(context):
         "map_network_template.xml"
     ], [])
 
-    # java.run(context, "org.matsim.pt2matsim.run.CreateDefaultPTMapperConfig", [
-    #     "map_network_template.xml"
-    # ], cwd=context.path(), vm_arguments=["-Djava.io.tmpdir=%s" % tmp_path])
-
-    # content = open("%s/map_network_template.xml" % context.path()).read()
-    
-    with open("%s/map_network_template.xml" % context.path()) as f_read:
-        content = f_read.read()
-
-        content = content.replace(
-            '<param name="inputNetworkFile" value="" />',
-            '<param name="inputNetworkFile" value="%s" />' % unmapped_network_path
-        )
-        content = content.replace(
-            '<param name="inputScheduleFile" value="" />',
-            '<param name="inputScheduleFile" value="%s" />' % unmapped_schedule_path
-        )
-        content = content.replace(
-            '<param name="numOfThreads" value="2" />',
-            '<param name="numOfThreads" value="%d" />' % context.config("threads")
-        )
-        content = content.replace(
-            '<param name="outputNetworkFile" value="" />',
-            '<param name="outputNetworkFile" value="%s/mapped_network.xml.gz" />' % context.path()
-        )
-        content = content.replace(
-            '<param name="outputScheduleFile" value="" />',
-            '<param name="outputScheduleFile" value="%s/mapped_schedule.xml.gz" />' % context.path()
-        )
-        content = content.replace(
-            '<param name="outputStreetNetworkFile" value="" />',
-            '<param name="outputStreetNetworkFile" value="%s/road_network.xml.gz" />' % context.path()
-        )
-
-        modesToKeep = "car,car_passenger,truck,taxi"
-        if context.config("route_bike"):
-            modesToKeep += ",bike"
-
-        content = content.replace(
-            '<param name="modesToKeepOnCleanUp" value="car" />',
-            '<param name="modesToKeepOnCleanUp" value="%s" />' % modesToKeep
-        )
-
-        content = content.replace(
-            '<param name="networkRouter" value="SpeedyALT" />',
-            '<param name="networkRouter" value="AStarLandmarks" />'
-        )
-
-        content = content.replace(
-            '<param name="networkModes" value="car,bus" />',
-            '<param name="networkModes" value="bus" />'
-        )
-        
-        content = content.replace(
-            '<param name="modeSpecificRules" value="false" />',
-            '<param name="modeSpecificRules" value="true" />'
-        )
-
-        content = content.replace(
-            '<param name="maxTravelCostFactor" value="5.0" />',
-            '<param name="maxTravelCostFactor" value="10" />' # before 6.5
-        )
-
-        
-
-        content = content.replace(
-            '</module>',
-            """
-              <parameterset type="transportModeAssignment" >
-			        <param name="maxLinkCandidateDistance" value="120.0" />
-			        <param name="nLinkThreshold" value="1" />
-			        <param name="networkModes" value="rail,light_rail,train" />
-			        <param name="scheduleMode" value="rail" />
-			        <param name="strictLinkRule" value="true" />
-		        </parameterset>
-            
-               <parameterset type="transportModeAssignment" >
-			        <param name="maxLinkCandidateDistance" value="180.0" />
-			        <param name="nLinkThreshold" value="1" />
-			        <param name="networkModes" value="tram" />
-			        <param name="scheduleMode" value="tram" />
-			        <param name="strictLinkRule" value="true" />
-		        </parameterset>
-
-				<parameterset type="transportModeAssignment" >
-			        <param name="maxLinkCandidateDistance" value="180.0" />
-			        <param name="nLinkThreshold" value="1" />
-			        <param name="networkModes" value="light_rail,subway" />
-			        <param name="scheduleMode" value="subway" />
-			        <param name="strictLinkRule" value="true" />
-		        </parameterset>
-
-				<parameterset type="transportModeAssignment" >
-			        <param name="maxLinkCandidateDistance" value="120.0" />
-			        <param name="nLinkThreshold" value="1" />
-			        <param name="networkModes" value="funicular" />
-			        <param name="scheduleMode" value="funicular" />
-			        <param name="strictLinkRule" value="true" />
-		        </parameterset>
-            </module>
-            """
-        )
-        
-
-        with open("%s/map_network.xml" % context.path(), "w+") as f:
-            f.write(content)
+    config_path = write_mapping_config(context, unmapped_network_path, unmapped_schedule_path)
 
     log4j_content = """<?xml version="1.0" encoding="UTF-8"?>
         <Configuration status="WARN">
@@ -170,17 +65,77 @@ def execute(context):
 
     # Run mapping process
     pt2matsim.run(context, "org.matsim.pt2matsim.run.PublicTransitMapper", [
-        "map_network.xml"
+        config_path
     ], vm_arguments=["-Dlog4j.configurationFile=file:log4j.xml"])
 
     assert (os.path.exists("%s/mapped_network.xml.gz" % context.path()))
     assert (os.path.exists("%s/mapped_schedule.xml.gz" % context.path()))
     assert (os.path.exists("%s/road_network.xml.gz" % context.path()))
+    if context.config("export_detailed_network"):
+        assert os.path.exists(os.path.join(context.path(), "detailed_network.csv"))
     assert (os.path.exists(context.stage("matsim.scenario.network.convert_pt_schedule")["vehicles"]))
 
     return {
-        "network": "%s/mapped_network.xml.gz" % context.path(),
-        "schedule": "%s/mapped_schedule.xml.gz" % context.path(),
-        "road_network": "%s/road_network.xml.gz" % context.path(),
-        "vehicles": context.stage("matsim.scenario.network.convert_pt_schedule")["vehicles"]
+        "network": os.path.join(context.path(), "mapped_network.xml.gz"),
+        "schedule": os.path.join(context.path(), "mapped_schedule.xml.gz"),
+        "road_network": os.path.join(context.path(), "road_network.xml.gz"),
+        "vehicles": context.stage("matsim.scenario.network.convert_pt_schedule")["vehicles"],
+        "geometry": os.path.join(context.path(), "detailed_network.csv")
     }
+
+
+####################### functions ######################
+
+def write_mapping_config(context, network_path, schedule_path):
+    """Set mapper parameters by name, independent of template defaults/formatting."""
+    tree = config_tools.read_config(os.path.join(context.path(), "map_network_template.xml"))
+    modules = tree.getroot().findall('module[@name="PublicTransitMapping"]')
+    if len(modules) != 1:
+        raise RuntimeError("Expected exactly one PublicTransitMapping module in template")
+    module = modules[0]
+
+    set_param = partial(config_tools.set_param, parent=module)
+
+    set_param("inputNetworkFile", network_path)
+    set_param("inputScheduleFile", schedule_path)
+    set_param("numOfThreads", context.config("threads"))
+    set_param("outputNetworkFile", os.path.join(context.path(), "mapped_network.xml.gz"))
+    set_param("outputScheduleFile", os.path.join(context.path(), "mapped_schedule.xml.gz"))
+    set_param("outputStreetNetworkFile", os.path.join(context.path(), "road_network.xml.gz"))
+    modes_to_keep = "car,car_passenger,truck,taxi"
+    if context.config("route_bike"):
+        modes_to_keep += ",bike"
+    set_param("modesToKeepOnCleanUp", modes_to_keep)
+    set_param("modeSpecificRules", True)
+    set_param("maxTravelCostFactor", 10)
+    set_param("splitLinksAtStops", True)
+    set_param("stopLinkSplittingModes", "bus")
+    if context.config("export_detailed_network"):
+        geometry_path = "%s/detailed_network.csv" % context.path("matsim.scenario.network.convert_osm")
+        if not os.path.isfile(geometry_path):
+            raise FileNotFoundError(f"Processed network geometry not found: {geometry_path}. "
+                                    "Rebuild matsim.scenario.network.convert_osm with detailed export enabled.")
+        set_param("inputNetworkGeometryFile", geometry_path)
+        set_param("outputNetworkGeometryFile", os.path.join(context.path(), "detailed_network.csv"))
+    else:
+        set_param("inputNetworkGeometryFile", "")
+        set_param("outputNetworkGeometryFile", "")
+
+    assignment = config_tools.get_parameter_set(module, "transportModeAssignment", {"scheduleMode": "bus"})
+    set_param("networkModes", "bus", parent=assignment)
+    for mode, network_modes, distance in (
+        ("rail", "rail,light_rail,train", 120.0),
+        ("tram", "tram", 180.0),
+        ("subway", "light_rail,subway", 180.0),
+        ("funicular", "funicular", 120.0),
+    ):
+        assignment = config_tools.get_parameter_set(module, "transportModeAssignment", {"scheduleMode": mode})
+        set_param("maxLinkCandidateDistance", distance, parent=assignment)
+        set_param("nLinkThreshold", 1, parent=assignment)
+        set_param("networkModes", network_modes, parent=assignment)
+        set_param("strictLinkRule", True, parent=assignment)
+
+    config_path = os.path.join(context.path(), "map_network.xml")
+    config_tools.write_config(tree, config_path)
+
+    return config_path

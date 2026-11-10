@@ -1,7 +1,10 @@
 import os.path
 import shutil
 import matsim.runtime.eqasim as eqasim
-from matsim.simulation.config_utils import java_boolean, parse_boolean
+from matsim.config.tools import (
+    java_boolean, parse_boolean, copy_config, adapt_existing_scenario,
+    resolve_output_file, scenario_input_parameters, change_params,
+)
 import logging
 logger = logging.getLogger("synpp")
 
@@ -10,10 +13,10 @@ def configure(context):
     context.stage("matsim.runtime.eqasim")
     context.config("use_vdf", default=False)
     context.config("input_downsampling")
-    context.config("use_freight")
+    context.config("use_freight", True)
     context.config("output_prefix", "switzerland_")
 
-    context.config("useScheduleBasedTransport", default=True)
+    context.config("useScheduleBasedTransport", default=False)
     context.config("preventwaitingtoentertraffic", default=False)
     context.config("writeexperiencedplans", default=False)
 
@@ -48,26 +51,28 @@ def execute(context):
     config = context.config("simulation_config_path")
     origin      = os.path.join(input_path, config)
     destination = os.path.join(output_path, config)
-    shutil.copy2(origin, destination)
+    copy_config(origin, destination, input_paths={
+        "eqasim": ("modeParametersPath", "costParametersPath"),
+        "ptZones": ("ptZonesFilePath", "sbbDistancesPath", "pricingDescriptionPath"),
+        "eqasim:alphaCalibration": ("filePath",),
+        "eqasim:networkCalibration": ("countsFile",),
+        "eqasim:networkCalibration.costCalibration": ("specialRegionPath",),
+        "eqasim:networkCalibration.freespeedCalibration": ("specialRegionPath", "observedTripsFile"),
+    })
 
-    prefix = "switzerland"
+    prefix = context.config("output_prefix")
     for file in ["facilities.xml.gz", "households.xml.gz", "network.xml.gz", "population.xml.gz",
                  "transit_schedule.xml.gz", "transit_vehicles.xml.gz", "vehicles.xml.gz"]:
-        origin      = os.path.join(input_path, prefix + "_" + file)
-        destination = os.path.join(output_path, prefix + "_" + file)
+        origin = resolve_output_file(os.path.join(input_path, prefix + file))
+        destination = os.path.join(output_path, os.path.basename(origin))
         shutil.copy2(origin, destination)
 
     config_path = os.path.join(output_path, config)
     assert os.path.exists(config_path)
 
-    eqasim.run(context, "org.eqasim.switzerland.ch_cmdp.scenario.RunAdaptConfig", [
-        "--input-path", config_path,
-        "--output-path", config_path,
-        "--downsamplingRate", context.config("input_downsampling"),
-        "--replanningRate", "0.05",
-        "--hasFreight", context.config("use_freight"),
-        "--prefix", context.config("output_prefix")
-    ])
+    adapt_existing_scenario(config_path, context.config("input_downsampling"),
+                            context.config("output_prefix"), context.config("use_freight"))
+    change_params(config_path, scenario_input_parameters(output_path, prefix))
 
     if (not context.config("use_vdf")):
         # Run simulation
@@ -92,6 +97,6 @@ def execute(context):
             "--config:controler.writePlansInterval", str(1),
             "--config:eqasim.useScheduleBasedTransport", scheduleBasedPTconfig,
         ])
-    assert os.path.exists("%s/simulation_output/output_events.xml.gz" % output_path)
+    resolve_output_file(os.path.join(output_path, "simulation_output", "output_events.xml"))
     
     return context.path()

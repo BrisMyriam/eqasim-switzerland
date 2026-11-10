@@ -2,15 +2,31 @@ import numpy as np
 import pandas as pd
 from shapely.geometry import Point
 import geopandas as gpd
-import random
 from pathlib import Path
 import logging
+import re
+
+from data.cross_border.survey_calibration import (
+    calibrate_demand, repair_car_occupancy, set_person_expansion_units, write_survey_audit, write_assignment_audit,
+)
+from data.cross_border.survey_locations import recover_locations, recover_unlocated_swiss_end
 
 logger = logging.getLogger("synpp")
 
 # Which border crossing points serve which mode. "label" comes from
 # data.cross_border.interview_places; car passengers cross with their driver.
 MODE_TO_LABEL = {"car": "road", "car_passenger": "road", "pt": "pt"}
+
+# ZUGTYP of the 2021 survey
+TRAIN_CATEGORIES = {"1": "long_distance", "2": "regional"}
+
+# A public transport traveller starts at one of the gateway stations of the crossing whose detour
+# (real end -> gateway -> other end) is at most this factor times the smallest one
+GATEWAY_DETOUR_FACTOR = 1.2
+
+# Road alternatives may add up to 20% to the shortest straight-line journey
+# via a crossing. Use the same threshold before and after agent expansion.
+ROAD_DETOUR_FACTOR = 1.2
 
 
 def configure(context):
@@ -20,11 +36,199 @@ def configure(context):
 
     context.stage("data.spatial.municipalities")
     context.stage("data.spatial.swiss_border")
+    context.stage("data.spatial.nuts")
+    context.stage("data.cross_border.road_exit_points")
     context.stage("data.cross_border.interview_places")
+    context.stage("data.cross_border.road_candidates")
+    context.stage("data.cross_border.car_targets")
+    context.stage("data.cross_border.pt_gateways")
 
-    context.config("border_offset", default = 20000)
-    context.config("cross_border_countries", default = "All")
+    context.config("border_offset", default = 50000)
+    context.config("cross_border_countries", default = 'All')
     context.config("cross_border_exclude_shapefiles", default=None)
+    context.config("include_external_population", default=True)
+
+
+def execute(context):
+
+    # Read survey observations without discarding missing-location demand.
+
+    rng = np.random.RandomState(context.config("random_seed"))
+
+    borders2021 = read_2021_data(context)
+    borders2015 = read_2015_data(context)
+
+    # Use vehicle controls before location or model-region exclusions. Occupancy
+    # affects passengers only; it cannot change the number of generated drivers.
+
+    borders, calibration = calibrate_demand(
+        borders2015, borders2021, context.stage("data.cross_border.car_targets"))
+    borders = repair_car_occupancy(borders, rng)
+    write_survey_audit(context, borders2015, borders, calibration)
+    borders = borders.loc[borders["location_usable"]].copy()
+
+    # Apply the requested origin-country subset after national calibration.
+
+    allowed_countries  = ["FR", "DE", "AT", "LI", "IT"]
+    selected_countries = context.config("cross_border_countries")
+
+    if selected_countries != "All":
+        if isinstance(selected_countries, list):
+            selected_countries = [c for c in selected_countries if c in allowed_countries]
+            if not selected_countries:
+                raise ValueError(
+                    f"No valid countries in selection. Must be within {allowed_countries}."
+                )
+
+            borders = borders.loc[borders["origin_country"].isin(selected_countries)].copy()
+
+        elif isinstance(selected_countries, str):
+            if selected_countries not in allowed_countries:
+                raise ValueError(
+                    f"Invalid country code '{selected_countries}'. Must be one of {allowed_countries}."
+                )
+            borders = borders.loc[borders["origin_country"] == selected_countries].copy()
+
+        else:
+            raise TypeError("cross_border_countries must be a list, string, or 'All'.")
+
+    # Expand supported visits and transit journeys into individual agents.
+
+    trips = borders[borders["travel_cat"].isin(["From CH", "To CH"])]
+    from_to_trips = process_from_to_trips(trips, context, rng)
+
+    through = borders[borders["travel_cat"]=="Through CH"]
+    through_trips = process_through_trips(through, len(from_to_trips), context, rng)
+
+    df = pd.concat([from_to_trips, through_trips], ignore_index = True)
+    before_exclusion = df.copy()
+
+    is_projected_columns = [c for c in ["origin_is_projected", "destination_is_projected"] if c in df.columns]
+    any_projected = df[is_projected_columns].any(axis = 1)
+    logger.info(
+        f"Overall: {any_projected.mean() * 100:.1f}% of the cross-border population has an origin and/or "
+        f"destination reprojected to the closest border crossing point ({any_projected.sum()}/{len(df)})"
+    )
+
+    # Remove people who really live in the spatial file to be excluded. This
+    # has to be checked against residence_x/residence_y (the real home
+    # location, before project_point_series_close_to_border may have snapped
+    # a far-away home onto a nearby border crossing point for the "origin"/
+    # "destination" columns) - checking origin_x/origin_y instead would catch
+    # a teleported person whose real home is nowhere near the excluded area,
+    # just because the crossing point their trip got projected onto happens
+    # to sit inside it.
+    exclude_file = context.config("cross_border_exclude_shapefiles")
+
+    # This polygon prevents overlap with the separate external population.
+    # Keep its network-extent setting available, but retain survey residents
+    # when that population is disabled: otherwise nobody replaces their trips.
+    if not context.config("include_external_population"):
+        exclude_file = None
+
+    if not exclude_file is None:
+        if isinstance(exclude_file, (str, Path)):
+            exclude_file = [exclude_file]
+
+        if not isinstance(exclude_file, (list, tuple)):
+            raise TypeError(
+                "cross_border_exclude_shapefiles must be a path or a list of paths."
+            )
+
+        gdfs = []
+
+        for f in exclude_file:
+            suffix = Path(f).suffix.lower()
+            if suffix not in {".gpkg", ".shp"}:
+                raise TypeError(
+                    f"{f} is not a .gpkg or .shp file."
+                )
+
+            gdf = gpd.read_file(f).to_crs("EPSG:2056")
+            gdfs.append(gdf)
+
+        exclude_region = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs="EPSG:2056")
+        residences     = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df["residence_x"], df["residence_y"]), crs="EPSG:2056")
+
+        # A country/exit/crossing proxy is a routing assumption, not an observed
+        # residence. Never remove someone because that proxy falls in the MMT area.
+        known = df["start_location_source"].isin(["reported", "municipality_code", "nuts_code"])
+        within = residences.geometry.within(exclude_region.geometry.union_all())
+        df["exclude"] = known & within
+
+        excluded_ids = df.loc[df["exclude"], "cross_border_person_id"].unique()
+        df = df[~df["cross_border_person_id"].isin(excluded_ids)].copy()
+
+        del df["exclude"]
+
+    # Export assignment coverage and return the generated population.
+
+    write_assignment_audit(context, before_exclusion, df)
+
+    return df
+
+
+def crossing_sampling_weights(candidates):
+    """One weight per physical road, even after filtering aliases by detour.
+
+    PT has no canonical road ID and keeps its original importance weight. Road
+    aliases retain their original coordinates/IDs; their combined probability
+    equals one physical crossing's capacity × importance, however many survive.
+    """
+    weights = candidates["selection_weight"].copy()
+    canonical = candidates["canonical_point_id"]
+    road = canonical.notna()
+    counts = canonical[road].groupby(canonical[road]).transform("size")
+    weights.loc[road] = weights.loc[road] / counts
+    return weights
+
+
+def repair_interview_place_names(names, known):
+    """
+    The 2021 survey file has "?" in place of some accented letters (Ch?ne-Bourg,
+    Les Verri?res), so these places did not match data.cross_border.interview_places
+    nor data.cross_border.pt_gateways. Each such name is replaced by the only known
+    place it matches with "?" standing for any letter.
+    """
+    mapping = {}
+    for name in pd.unique(names[names.astype(str).str.contains("?", regex = False)]):
+        pattern = re.compile(re.escape(name).replace(re.escape("?"), "."))
+        matches = [k for k in set(known) if pattern.fullmatch(str(k))]
+        if len(matches) == 1:
+            mapping[name] = matches[0]
+        else:
+            logger.warning(f"Interview place {name} matches {len(matches)} known places: left as is")
+
+    return names.replace(mapping)
+
+
+def sample_gateway(candidates, point, other_point, rng):
+    """
+    One gateway station of a crossing (data.cross_border.pt_gateways) for a public
+    transport traveller whose real end abroad is point, the other end of the trip
+    other_point (or None). Always taking the closest one sent everyone living beyond
+    the same gateway onto it, e.g. all of the Lyon area onto Tenay-Hauteville, a
+    village station with 8 trains a day. Among the gateways on the way (see
+    GATEWAY_DETOUR_FACTOR), one is drawn in proportion to its departures of trains
+    coming from beyond the perimeter, where the traveller lives: not the local
+    trains of the stations next to the border (Pougny-Chancy). Without such trains,
+    in proportion to all departures, and evenly for the gateways of
+    cross_border_pt_gateways_file, which have none.
+    """
+    detour = candidates.geometry.distance(point).values
+    if other_point is not None:
+        detour = detour + candidates.geometry.distance(other_point).values
+
+    eligible = candidates[detour <= detour.min() * GATEWAY_DETOUR_FACTOR]
+
+    weights = None
+    for column in ("far_departures", "departures"):
+        values = eligible[column].astype(float).fillna(0.0)
+        if values.sum() > 0:
+            weights = values
+            break
+
+    return eligible.sample(n = 1, weights = weights, random_state = rng).iloc[0]
 
 
 def sample_rows_by_weight(df2, rng, weight_col="weight"):
@@ -41,23 +245,13 @@ def sample_rows_by_weight(df2, rng, weight_col="weight"):
     # random_seed so that the generated population is reproducible)
     fractional_mask = rng.random_sample(len(df)) < df["frac_part"]
     fractional = df[fractional_mask].drop(columns=["int_part", "frac_part"])
-    
+
     # Combine both
     sampled_df = pd.concat([repeated, fractional], ignore_index=True)
     return sampled_df
 
 
-def sample_points_in_polygon(polygon, n):
-    points = []
-    minx, miny, maxx, maxy = polygon.bounds
-    while len(points) < n:
-        p = Point(random.uniform(minx, maxx), random.uniform(miny, maxy))
-        if polygon.contains(p):
-            points.append(p)
-    return points
-
-
-def project_point_series_close_to_border(df, x, y, distance_threshold, default_purpose, projected_purpose, column_name, context, rng, mode_column = "trip_mode", interview_place_column = "interview_place", other_x = None, other_y = None):
+def project_point_series_close_to_border(df, x, y, distance_threshold, default_purpose, projected_purpose, column_name, context, rng, mode_column = "trip_mode", interview_place_column = "interview_place", other_x = None, other_y = None, other_crs = "EPSG:4326", restrict_column = None, update_interview_point = True):
     df = df.copy()
     points = gpd.GeoDataFrame(geometry=gpd.points_from_xy(df[x], df[y]), crs = "EPSG:4326").to_crs("EPSG:2056")
     points["record"] = range(len(points))
@@ -72,12 +266,18 @@ def project_point_series_close_to_border(df, x, y, distance_threshold, default_p
     # covers 2 - so this still leaves a choice among those).
     points["interview_place"] = df[interview_place_column].values if interview_place_column in df.columns else None
 
+    # Public transport: whether the gateway has to be one of the surveyed crossing's
+    # (always, except for the end of a "Through" trip the survey did not observe),
+    # and whether the respondent was on a long-distance train.
+    points["restrict_to_place"] = df[restrict_column].values if restrict_column is not None else True
+    points["train_category"] = df["train_category"].values if "train_category" in df.columns else None
+
     # The other end of the trip (destination when projecting the origin, and
     # vice-versa), used below to minimize the total origin->crossing->destination
     # detour - same criterion as read_2021_data.sample_point.
     if other_x is not None and other_y is not None:
         points["other_geometry"] = gpd.GeoSeries(
-            gpd.points_from_xy(df[other_x], df[other_y]), crs = "EPSG:4326"
+            gpd.points_from_xy(df[other_x], df[other_y]), crs = other_crs
         ).to_crs("EPSG:2056").values
     else:
         points["other_geometry"] = None
@@ -87,25 +287,54 @@ def project_point_series_close_to_border(df, x, y, distance_threshold, default_p
 
     points["dist_to_border"] = points.geometry.apply(lambda g: g.distance(ch_borders_simple)) / 1000
     close_mask               = points["dist_to_border"] < distance_threshold
-    far_mask                 = ~close_mask
+    proxy_source = "start_location_source" if column_name == "origin" else "end_location_source"
+    crossing_proxy = df.get(proxy_source, pd.Series("reported", index = df.index)).eq("crossing_proxy").to_numpy()
+    close_mask = close_mask & ~crossing_proxy
+    far_mask = ~close_mask
 
     far_points   = points[far_mask].copy()
     close_points = points[close_mask].copy()
 
     # Points too far from the border are projected onto a surveyed interview
     # place instead of using their own (real, but far away) coordinate - same
-    # distance+importance selection as read_2021_data.sample_point, minimizing
-    # the origin->crossing->destination detour and drawing (importance-weighted)
-    # among the candidates within 20% of that minimum. This is independently
+    # distance and capacity × importance selection as read_2021_data.sample_point, minimizing
+    # the origin->crossing->destination detour and drawing (capacity × importance)
+    # among road candidates within 20% of that minimum (also 20% for PT). This is independently
     # re-drawn here rather than reusing sample_point's own pick: this function
     # runs after expand_and_sample/sample_rows_by_weight, so the several expanded
     # copies of one respondent (occupants, weight duplicates) can each land on a
     # different, similarly-good crossing instead of collapsing onto a single one.
-    interview_points = context.stage("data.cross_border.interview_places").copy()[
-        ["geometry", "border_crossing_point_id", "label", "interview_place", "importance"]].reset_index(drop = True)
+    interview_points = context.stage("data.cross_border.road_candidates").copy()[
+        ["geometry", "border_crossing_point_id", "label", "interview_place", "importance", "selection_weight", "canonical_point_id"]].reset_index(drop = True)
     grouped_points = {k: v for k, v in interview_points.groupby(["label", "interview_place"])}
 
+    # Public transport points are not moved onto the interview place, a station on
+    # the border where most long-distance trains do not stop, but onto a gateway
+    # station further abroad (data.cross_border.pt_gateways): the one closest to the
+    # real point, among those served by long-distance trains for the long-distance
+    # travellers. Interview places without gateways fall back to the interview place.
+    pt_gateways = context.stage("data.cross_border.pt_gateways")[
+        ["geometry", "gateway_id", "interview_place", "has_long_distance", "departures", "far_departures"]].reset_index(drop = True)
+    grouped_gateways = {k: v for k, v in pt_gateways.groupby("interview_place")}
+
+    def sample_pt_gateway(row):
+        candidates = grouped_gateways.get(row["interview_place"]) if row["restrict_to_place"] else pt_gateways
+
+        if candidates is None or len(candidates) == 0:
+            return None
+
+        if row["train_category"] == "long_distance" and candidates["has_long_distance"].any():
+            candidates = candidates[candidates["has_long_distance"]]
+
+        gateway = sample_gateway(candidates, row["geometry"], row["other_geometry"], rng)
+        return pd.Series({"geometry": gateway["geometry"], "border_crossing_point_id": gateway["gateway_id"], "is_pt_gateway": True})
+
     def sample_far_point(row):
+        if row["label"] == "pt":
+            gateway = sample_pt_gateway(row)
+            if gateway is not None:
+                return gateway
+
         candidates = grouped_points.get((row["label"], row["interview_place"]))
 
         if candidates is None or len(candidates) == 0:  # no point at this interview_place for this mode: fall back to mode alone
@@ -119,23 +348,28 @@ def project_point_series_close_to_border(df, x, y, distance_threshold, default_p
         else:
             total_dist = candidates["geometry"].apply(lambda g: row["geometry"].distance(g))
 
-        eligible = candidates[total_dist <= total_dist.min() * 1.2]
+        factor = ROAD_DETOUR_FACTOR if row["label"] == "road" else GATEWAY_DETOUR_FACTOR
+        eligible = candidates[total_dist <= total_dist.min() * factor]
 
-        weights = eligible["importance"]
+        weights = crossing_sampling_weights(eligible)
         if not np.isfinite(weights).all() or weights.sum() <= 0:
             weights = None
 
         sampled = eligible.sample(n = 1, weights = weights, random_state = rng)
-        return sampled.iloc[0][["geometry", "border_crossing_point_id"]]
+        return pd.Series({"geometry": sampled.iloc[0]["geometry"],
+                          "border_crossing_point_id": sampled.iloc[0]["border_crossing_point_id"],
+                          "is_pt_gateway": False})
 
     far_points["geometry_before_projection"] = far_points["geometry"]
 
     if len(far_points) > 0:
         sampled = far_points.apply(sample_far_point, axis = 1)
-        far_points["geometry"]  = sampled["geometry"].values
-        far_points["point_id"]  = sampled["border_crossing_point_id"].values
+        far_points["geometry"]      = sampled["geometry"].values
+        far_points["point_id"]      = sampled["border_crossing_point_id"].values
+        far_points["is_pt_gateway"] = sampled["is_pt_gateway"].astype(bool).values
     else:
-        far_points["point_id"] = None
+        far_points["point_id"]      = None
+        far_points["is_pt_gateway"] = False
 
     far_points["purpose"]      = projected_purpose
     far_points["is_projected"] = True
@@ -143,6 +377,7 @@ def project_point_series_close_to_border(df, x, y, distance_threshold, default_p
     close_points["geometry_before_projection"] = close_points["geometry"]
     close_points["purpose"]             = default_purpose
     close_points["is_projected"]        = False
+    close_points["is_pt_gateway"]       = False
     close_points["point_id"]            = None  # a real location, not a crossing
 
     points = pd.concat([far_points, close_points])
@@ -152,6 +387,7 @@ def project_point_series_close_to_border(df, x, y, distance_threshold, default_p
     df[column_name + "_before_projection"] = points["geometry_before_projection"].values
     df[column_name + "_purpose"]           = points["purpose"].values
     df[column_name + "_is_projected"]      = points["is_projected"].values
+    df[column_name + "_is_pt_gateway"]     = points["is_pt_gateway"].astype(bool).values
     df[column_name + "_point_id"]          = points["point_id"].values
 
     # A projected/teleported person's origin (or destination) IS their
@@ -160,13 +396,18 @@ def project_point_series_close_to_border(df, x, y, distance_threshold, default_p
     # consistent with the point they were actually projected onto here -
     # otherwise they could end up assigned to two distinct interview places
     # (one for their location, a different one for that pseudo-activity).
-    if "interview_point_id" in df.columns and "interview_geometry_point" in df.columns:
-        mask = df[column_name + "_is_projected"]
+    # A pt gateway is not a crossing: public transport agents get no border
+    # activity, and their interview point stays the crossing they were surveyed at.
+    # Through-trips also retain that observed point: shortening a foreign endpoint
+    # does not provide another observation of where the person crossed Switzerland.
+    if update_interview_point and "interview_point_id" in df.columns and "interview_geometry_point" in df.columns:
+        mask = df[column_name + "_is_projected"] & ~df[column_name + "_is_pt_gateway"]
         df.loc[mask, "interview_point_id"]       = df.loc[mask, column_name + "_point_id"]
         df.loc[mask, "interview_geometry_point"] = df.loc[mask, column_name + "_point"]
 
     share_projected = df[column_name + "_is_projected"].mean() * 100
     logger.info(f"{column_name}: {share_projected:.1f}% of records reprojected to the closest border crossing point ({df[column_name + '_is_projected'].sum()}/{len(df)})")
+    logger.info(f"{column_name}: {df[column_name + '_is_pt_gateway'].sum()} public transport records moved onto a pt gateway station")
 
     del df[x]
     del df[y]
@@ -233,16 +474,14 @@ def process_from_to_trips(df_trips, context, rng):
 
     # 1. Remove "through" trips that were not classified properly
     trips    = df_trips[(df_trips["origin_country"]=="CH") | (df_trips["destination_country"]=="CH")].copy()
-    trips_od = trips[["origin_country", "destination_country", "origin_country_raw", "destination_country_raw",
-        "start_x", "start_y", "end_x", "end_y", "trip_mode", "trip_purpose", "weight", "nb_passengers",
+    trips_od = trips[["origin_place", "destination_place", "interview_id", "start_location_source", "end_location_source", "origin_country", "destination_country", "origin_country_raw", "destination_country_raw",
+        "start_x", "start_y", "end_x", "end_y", "trip_mode", "train_category", "trip_purpose", "weight", "nb_passengers",
         "interview_place", "interview_point_id", "interview_geometry_point"]].copy()
 
-    # 2. Remove trips with missing information on start or end point
-    mask_missing_start = pd.to_numeric(trips_od["start_x"], errors="coerce").isna() # If start_x is missing, so is origin_place, so we cannot use one value to compensate the absence of the other.
-    mask_missing_end   = pd.to_numeric(trips_od["end_x"], errors="coerce").isna()   # Same with destinations
-    
-     # This removes 1.49% of the records
-    df = trips_od[~(mask_missing_start) & ~(mask_missing_end)].copy()
+    # The reader resolves endpoints before this step and reports unresolved
+    # weights separately, so expansion cannot silently absorb missing demand.
+
+    df = trips_od.copy()
 
     # Reorder start and end so that all trips end in CH. The raw country codes
     # have to be swapped along with everything else, otherwise the records
@@ -253,19 +492,31 @@ def process_from_to_trips(df_trips, context, rng):
     df.loc[mask, ["origin_country_raw", "destination_country_raw"]] = df.loc[mask, ["destination_country_raw", "origin_country_raw"]].values
     df.loc[mask, ["start_x", "end_x"]] = df.loc[mask, ["end_x", "start_x"]].values
     df.loc[mask, ["start_y", "end_y"]] = df.loc[mask, ["end_y", "start_y"]].values
+    df.loc[mask, ["start_location_source", "end_location_source"]] = df.loc[mask, ["end_location_source", "start_location_source"]].values
+    df.loc[mask, ["origin_place", "destination_place"]] = df.loc[mask, ["destination_place", "origin_place"]].values
 
     # Prepare to sample points from destination municipality
     destinations = df.copy().apply(lambda row: Point(row["end_x"], row["end_y"]), axis = 1)
     destinations = gpd.GeoSeries(destinations, crs = "EPSG:4326").to_crs("EPSG:2056")
 
     joined = sjoin_within_unique(destinations, df_municipalities)
+    missing = joined["municipality_id"].isna().to_numpy()
+    if missing.any():
+        # Preserve known Swiss municipality information when the supplied point
+        # falls just outside its border; do not redistribute this demand.
+        df = recover_unlocated_swiss_end(df, "end", missing, context)
+        destinations = gpd.GeoSeries(gpd.points_from_xy(df["end_x"], df["end_y"]), crs = 4326).to_crs(2056)
+        joined = sjoin_within_unique(destinations, df_municipalities)
+
 
     df["destination_municipality"] = joined["municipality_id"].values
 
-    # In 23 cases, corresponding mostly to people going to Liechtenstein or to points exactly on the border
-    # in le Locle or Saint-Gingolph, the municipality cannot be found. 
-    # Let's remove these observations.
-    df = df[df["destination_municipality"].notna()].copy()
+    # Report any remaining Swiss endpoint that could not be placed. Its weight
+    # is not redistributed to another survey respondent.
+    missing = df["destination_municipality"].isna()
+    df.loc[missing, ["interview_id", "interview_place", "trip_mode", "weight", "end_x", "end_y"]].to_csv(
+        f"{context.path()}/unlocated_swiss_end.csv", index = False)
+    df = df.loc[~missing].copy()
 
     df = expand_and_sample(df.copy(), "nb_passengers", "weight", rng)
 
@@ -293,7 +544,7 @@ def process_from_to_trips(df_trips, context, rng):
     df["destination_point_id"]      = None
     df["is_border_point_projected"] = df["origin_is_projected"]
 
-    df = df[["cross_border_person_id", "label",
+    df = df[["cross_border_person_id", "label", "interview_id", "start_location_source", "end_location_source",
         "origin_x", "origin_y", "destination_x", "destination_y",
         "residence_x", "residence_y",
         "trip_mode", "trip_purpose",
@@ -308,16 +559,19 @@ def process_from_to_trips(df_trips, context, rng):
 def process_through_trips(through_trips, N, context, rng):
     border_offset_km = context.config("border_offset") / 1000
 
+    # Road border interviews observe entry into Switzerland. Keep that direction
+    # and any reported exit through expansion; rail has an explicit direction.
     through_od = through_trips[
-        ["origin_country", "destination_country", "origin_country_raw", "destination_country_raw",
-        "start_x", "start_y", "end_x", "end_y", "trip_mode", "trip_purpose", "weight", "nb_passengers",
-        "interview_place", "interview_point_id", "interview_geometry_point"]
+        ["start_location_source", "end_location_source", "origin_country", "destination_country", "origin_country_raw", "destination_country_raw",
+        "start_x", "start_y", "end_x", "end_y", "trip_mode", "train_category", "trip_purpose", "weight", "nb_passengers",
+        "interview_place", "interview_point_id", "interview_geometry_point", "direction_crossing",
+        "interview_id", "survey_exit_code", "survey_exit_name"]
     ]
 
-    mask_missing_start = pd.to_numeric(through_od["start_x"], errors="coerce").isna()  # If start_x is missing, so is origin_place, so we cannot use one value to compensate the absence of the other.
-    mask_missing_end   = pd.to_numeric(through_od["end_x"], errors="coerce").isna()
+    # Only placeable records reach expansion; unresolved survey mass remains
+    # visible in survey_demand_audit.csv rather than inflating other records.
 
-    df = through_od[~(mask_missing_start) & ~(mask_missing_end)].copy() # This removes 9% / 11.3% of the records (unweighted/weighted)
+    df = through_od.copy()
 
     df_expanded = df.loc[df.index.repeat(df["nb_passengers"])].copy()
     df_expanded["passenger_index"] = df_expanded.groupby(df_expanded.index).cumcount() + 1
@@ -331,8 +585,27 @@ def process_through_trips(through_trips, N, context, rng):
 
     df = df_sampled.copy().reset_index()
 
-    df = project_point_series_close_to_border(df.copy(), "start_x", "start_y", border_offset_km, "other", "other", "origin", context, rng, other_x = "end_x", other_y = "end_y")
-    df = project_point_series_close_to_border(df.copy(), "end_x", "end_y", border_offset_km, "other", "other", "destination", context, rng, other_x = "origin_x", other_y = "origin_y")
+    # The survey observed one crossing only. A far-away public transport end is moved
+    # onto a gateway of that crossing if it is the end the crossing is closer to, and
+    # onto the closest gateway of any crossing otherwise (data.cross_border.pt_gateways).
+    starts = gpd.GeoSeries(gpd.points_from_xy(df["start_x"], df["start_y"]), crs = "EPSG:4326").to_crs("EPSG:2056")
+    ends   = gpd.GeoSeries(gpd.points_from_xy(df["end_x"], df["end_y"]), crs = "EPSG:4326").to_crs("EPSG:2056")
+    crossings = gpd.GeoSeries(df["interview_geometry_point"].values, crs = "EPSG:2056")
+    df["origin_at_crossing"] = (starts.distance(crossings) <= ends.distance(crossings)).values
+    df["destination_at_crossing"] = ~df["origin_at_crossing"]
+
+    # Shortening either foreign endpoint must not replace the surveyed crossing.
+    df = project_point_series_close_to_border(df.copy(), "start_x", "start_y", border_offset_km, "other", "other", "origin", context, rng, other_x = "end_x", other_y = "end_y", restrict_column = "origin_at_crossing", update_interview_point = False)
+    # The other end of the destination is the real origin. start_x/start_y (WGS84) are
+    # gone after the origin projection, origin_before_projection holds it in LV95.
+    df["real_origin_x"] = df["origin_before_projection"].apply(lambda p: p.x)
+    df["real_origin_y"] = df["origin_before_projection"].apply(lambda p: p.y)
+
+    df = project_point_series_close_to_border(df.copy(), "end_x", "end_y", border_offset_km, "other", "other", "destination", context, rng, other_x = "real_origin_x", other_y = "real_origin_y", other_crs = "EPSG:2056", restrict_column = "destination_at_crossing", update_interview_point = False)
+
+    # The road destination above is provisional. through_crossings uses the
+    # original destination below to place it on the correct side of the network;
+    # the sampled PT gateway and the seeded expansion order remain unchanged.
 
     df["cross_border_person_id"] = range(N, N + len(df))
     df["cross_border_person_id"] = "CBS_" + df["cross_border_person_id"].astype(str)
@@ -353,16 +626,101 @@ def process_through_trips(through_trips, N, context, rng):
     # Either end of a through-trip can be projected, since neither is a real point inside CH.
     df["is_border_point_projected"] = df["origin_is_projected"] | df["destination_is_projected"]
 
-    df = df[["cross_border_person_id", "label",
+    df = df[["cross_border_person_id", "label", "start_location_source", "end_location_source",
         "origin_x", "origin_y", "destination_x", "destination_y",
         "residence_x", "residence_y", "destination_residence_x", "destination_residence_y",
         "trip_mode", "trip_purpose",
         "is_border_point_projected", "origin_is_projected", "destination_is_projected",
         "origin_point_id", "destination_point_id",
-        "interview_place", "interview_point_id", "interview_geometry_point",
+        "interview_place", "interview_point_id", "interview_geometry_point", "direction_crossing",
+        "interview_id", "survey_exit_code", "survey_exit_name",
         "origin_country", "destination_country", "origin_country_raw", "destination_country_raw"]]
 
     return df
+
+
+def match_interview_points(borders, context):
+    """
+    Gives every survey record (start_x/start_y and end_x/end_y in WGS84) the border
+    crossing point it was surveyed at: one of the points of its interview_place
+    serving its mode, close to the shortest origin -> point -> destination path.
+    Shared with data.cross_border.swiss_residents_od.
+    """
+
+    points = context.stage("data.cross_border.road_candidates").copy()[["interview_place", "border_crossing_point_id", "geometry", "importance", "selection_weight", "canonical_point_id", "label"]].to_crs("EPSG:2056")
+    points["interview_point_id"] = points["border_crossing_point_id"]
+
+    # Survey endpoints are longitude/latitude; crossing distances must use Swiss
+    # metres at both ends. Keep the original columns in WGS84 for later stages.
+    matching = borders[["interview_place", "trip_mode"]].copy()
+    matching["origin_geometry"] = gpd.GeoSeries(
+        gpd.points_from_xy(borders["start_x"], borders["start_y"]), crs = "EPSG:4326"
+    ).to_crs("EPSG:2056").values
+    matching["destination_geometry"] = gpd.GeoSeries(
+        gpd.points_from_xy(borders["end_x"], borders["end_y"]), crs = "EPSG:4326"
+    ).to_crs("EPSG:2056").values
+
+    # "label" indicates which mode a point was surveyed for ("road" serves car trips,
+    # "pt" serves public transport trips), so candidates are grouped by place AND mode.
+    mode_to_label = MODE_TO_LABEL
+
+    grouped_points = {k: v for k, v in points.groupby(["interview_place", "label"])}
+
+    point_rng = np.random.RandomState(context.config("random_seed"))
+
+    def sample_point(row):
+        origin      = row["origin_geometry"]
+        destination = row["destination_geometry"]
+
+        label = mode_to_label.get(row["trip_mode"])
+        candidates = grouped_points.get((row["interview_place"], label))
+        if candidates is not None and "importance" in candidates.columns:
+            # Minimize the detour through the crossing (origin -> point -> destination),
+            # then draw capacity × importance-weighted among candidates within
+            # the mode's detour threshold. The minimum is always included.
+            total_dist = candidates["geometry"].apply(lambda g: origin.distance(g) + destination.distance(g))
+            factor = ROAD_DETOUR_FACTOR if label == "road" else GATEWAY_DETOUR_FACTOR
+            eligible = candidates[total_dist <= total_dist.min() * factor]
+
+            weights = crossing_sampling_weights(eligible)
+            if not np.isfinite(weights).all() or weights.sum() <= 0:
+                weights = None
+
+            sampled = eligible.sample(n = 1,
+                                      weights = weights,
+                                      random_state = point_rng)
+            return sampled.iloc[0][["geometry", "importance", "interview_point_id", "label"]]
+
+        # Fall back to the closest point that still matches the trip's mode, if any exist
+        same_label = points[points["label"] == label] if label is not None else points
+        if len(same_label) == 0:
+            same_label = points
+
+        total_dist = same_label["geometry"].apply(lambda g: origin.distance(g) + destination.distance(g))
+        closest    = same_label.loc[total_dist.idxmin()]
+        return closest[["geometry", "importance", "interview_point_id", "label"]]
+
+    result = matching.apply(sample_point, axis=1)
+    borders[["interview_geometry_point", "importance", "interview_point_id", "interview_point_label"]] = result
+
+    # The point has to serve the mode the agent travels with, since it becomes
+    # that agent's border activity in data.cross_border.activities: car (and
+    # its passengers) cross at a road point, public transport at a pt one. That
+    # holds by construction above, including in the fallback, so this only
+    # catches a mode that mode_to_label does not know about.
+    expected_label = borders["trip_mode"].map(mode_to_label)
+    mismatched     = expected_label.notna() & (borders["interview_point_label"] != expected_label)
+
+    assert not mismatched.any(), (
+        "%d records got a border crossing point that does not serve their mode, e.g. %s"
+        % (int(mismatched.sum()),
+           borders.loc[mismatched, ["trip_mode", "interview_point_label"]].head().to_dict("records"))
+    )
+
+    logger.info("Border crossing points by mode: %s",
+                borders.groupby(["trip_mode", "interview_point_label"]).size().to_dict())
+
+    return borders
 
 
 def read_2021_data(context):
@@ -373,6 +731,12 @@ def read_2021_data(context):
     data_path = f"{data_path}/crossborder/AuGQPV_2021/AGQPV21_finale_Auswertungsdatenbank.csv"
 
     df2021 = pd.read_csv(data_path, encoding="latin1", sep = ";")
+
+    # These road-route fields are separate from FAHRTRICHTUNGGU (rail only).
+    # Keep unknown/blank exit codes as missing, without inventing an exit.
+    exit_codes = pd.to_numeric(df2021.get("GUAUSREISESTRASSE", pd.Series(index = df2021.index, dtype = object)), errors = "coerce")
+    exit_codes = exit_codes.where(exit_codes.ne(9999)).astype("Int64")
+    exit_names = read_road_exit_names(Path(data_path).with_name("AGQPV21_finale_Auswertungsdatenbank_Codebuch.xlsx")) if exit_codes.notna().any() else {}
 
     df2021 = df2021[["INTERVIEWID", "BEFRAGUNGSORTID", "BEFRAGUNGSORT", "GRENZABSCHNITT", "TAGESTYP", "VERKEHRSTRAEGER", "UEBERGANGSART", "FAHRZEUGTYP", "GRUPPENGROESSE",
                  "WOHNORTLANDISO", "WOHNORT_GISCO_ID", "STARTORTLANDISO", "STARTORT_GISCO_ID", "ZIELORTLANDISO", "ZIELORT_GISCO_ID",
@@ -386,6 +750,12 @@ def read_2021_data(context):
                   "start_y", "start_x", "end_y", "end_x", 
                   "trip_purpose", "nb_nights", "country1", "country2", "country3",
                   "train_type", "direction_crossing", "direction_alps", "travel_cat", "weight", "weight_vehicles"]
+
+    df2021["survey_exit_code"] = exit_codes
+    df2021["survey_exit_name"] = exit_codes.map(exit_names)
+
+    df2021["interview_place"] = repair_interview_place_names(
+        df2021["interview_place"], context.stage("data.cross_border.interview_places")["interview_place"])
     
     # Process the columns
     # 1. Rename countries
@@ -403,11 +773,13 @@ def read_2021_data(context):
     df2021.loc[df2021["road_type"]=="1", "road_type"] = "road"
     df2021.loc[df2021["road_type"]=="2", "road_type"] = "rail"
     
+    # Keep the original vehicle type for occupancy validation before expansion.
+    df2021["survey_vehicle_type"] = pd.to_numeric(df2021["vehicle_type"], errors = "coerce")
+
     # 3. Identify vehicles
     df2021["vehicle_type"] = df2021["vehicle_type"].astype(str)
     df2021.loc[df2021["vehicle_type"]=="1", "vehicle_type"] = "car"
     df2021.loc[df2021["vehicle_type"]=="2", "vehicle_type"] = "car" #"motorcycle"
-    df2021.loc[df2021["vehicle_type"]=="3", "vehicle_type"] = "pt"  #"long distance bus"
     
     # 4. Identify trip purpose
     df2021["trip_purpose"] = df2021["trip_purpose"].astype(str)
@@ -423,6 +795,12 @@ def read_2021_data(context):
     df2021["direction_crossing"] = df2021["direction_crossing"].astype(str)
     df2021.loc[df2021["direction_crossing"]=="1", "direction_crossing"] = "entering CH"
     df2021.loc[df2021["direction_crossing"]=="2", "direction_crossing"] = "leaving CH"
+
+    # BFS's road-border survey is conducted on entry. A blank rail-only field
+    # therefore does not make a road respondent's direction unknown (BFS 2023,
+    # Leistungen des privaten Personenverkehrs, p. 10, footnote 5).
+    road_border = df2021["road_type"].eq("road") & df2021["crossing_cat"].eq(1)
+    df2021.loc[road_border, "direction_crossing"] = "entering CH"
     
     # 6. For the Alps crossing, not used currently
     df2021["direction_alps"] = df2021["direction_alps"].astype(str)
@@ -442,7 +820,11 @@ def read_2021_data(context):
     df2021.loc[df2021["day_cat"]=="Sonntag", "day_cat"]    = "WE"
     df2021.loc[df2021["day_cat"]=="Wochenende", "day_cat"] = "WE"
     
-    # 9. Identify the train category for rail observations
+    # 9. Identify the train category for rail observations (kept as train_category:
+    # long-distance travellers are sent to a gateway station served by long-distance
+    # trains, see data.cross_border.pt_gateways)
+    df2021["train_type"] = df2021["train_type"].astype(str).str.strip()
+    df2021["train_category"] = df2021["train_type"].map(TRAIN_CATEGORIES)
     df2021.loc[df2021["train_type"]=="1", "train_type"] = "pt" #"long distance train"
     df2021.loc[df2021["train_type"]=="2", "train_type"] = "pt" #"regional train"
 
@@ -451,12 +833,15 @@ def read_2021_data(context):
 
     df2021["weight"]          = df2021["weight"].astype(float)
     df2021["weight_vehicles"] = df2021["weight_vehicles"].replace("", 0).replace(" ", 0).fillna(0).astype(float)
-    df2021.loc[df2021["road_type"]=="road", "weight"] = 2 * df2021[df2021["road_type"]=="road"]["weight_vehicles"] 
-    
+    df2021.loc[df2021["road_type"]=="road", "weight"] = 2 * df2021[df2021["road_type"]=="road"]["weight_vehicles"]
+
     df2021.loc[:, "group_weight"] = df2021["weight"]
     df2021.loc[df2021["road_type"]=="road", "group_weight"] = df2021[df2021["road_type"]=="road"]["weight"] * df2021[df2021["road_type"]=="road"]["nb_passengers"]
     df2021["group_weight"] = df2021["group_weight"].astype(float)
-    
+
+    # Rail weights already count individuals; road occupancy still expands passengers.
+    df2021 = set_person_expansion_units(df2021)
+
     del df2021["road_type"]
     del df2021["vehicle_type"]
     del df2021["train_type"]
@@ -499,77 +884,27 @@ def read_2021_data(context):
     borders = borders[~ residents_ch_mask].copy()
 
     for col in ["start_x", "start_y", "end_x", "end_y"]:
-        borders[col] = pd.to_numeric(borders[col].str.strip(), errors="coerce")
+        borders[col] = pd.to_numeric(borders[col], errors="coerce")
 
-    borders = borders[borders["start_x"].notna() & borders["start_y"].notna()]
-    borders = borders[borders["end_x"].notna() & borders["end_y"].notna()]
+    # Recover locations without dropping their demand before vehicle calibration.
+    borders = recover_locations(borders, context)
+    all_borders = borders.copy()
+    borders = borders.loc[borders["location_usable"]].copy()
 
-    # 14. Match to an interview point    
-    #borders.loc[borders["interview_place"] == "Vallorbe (544)", "interview_place"] = "Gruppe O: VD/NE -> F. Dép. Jura. Doubs"
+    if borders.empty:
+        for column in ["interview_geometry_point", "importance", "interview_point_id"]:
+            all_borders[column] = None
+        return all_borders
 
-    points = context.stage("data.cross_border.interview_places").copy()[["interview_place", "border_crossing_point_id", "geometry", "importance", "label"]]
-    points["interview_point_id"] = points["border_crossing_point_id"]
+    # 14. Match to an interview point
 
-    # "label" indicates which mode a point was surveyed for ("road" serves car trips,
-    # "pt" serves public transport trips), so candidates are grouped by place AND mode.
-    mode_to_label = MODE_TO_LABEL
+    borders = match_interview_points(borders, context)
 
-    grouped_points = {k: v for k, v in points.groupby(["interview_place", "label"])}
-
-    point_rng = np.random.RandomState(context.config("random_seed"))
-
-    def sample_point(row):
-        origin      = Point(row["start_x"], row["start_y"])
-        destination = Point(row["end_x"], row["end_y"])
-
-        label = mode_to_label.get(row["trip_mode"])
-        candidates = grouped_points.get((row["interview_place"], label))
-        if candidates is not None and "importance" in candidates.columns:
-            # Minimize the detour through the crossing (origin -> point -> destination),
-            # then draw importance-weighted among the candidates within 20% of that
-            # minimum (the minimizing candidate is always included).
-            total_dist = candidates["geometry"].apply(lambda g: origin.distance(g) + destination.distance(g))
-            eligible   = candidates[total_dist <= total_dist.min() * 1.2]
-
-            weights = eligible["importance"]
-            if not np.isfinite(weights).all() or weights.sum() <= 0:
-                weights = None
-
-            sampled = eligible.sample(n = 1,
-                                      weights = weights,
-                                      random_state = point_rng)
-            return sampled.iloc[0][["geometry", "importance", "interview_point_id", "label"]]
-
-        # Fall back to the closest point that still matches the trip's mode, if any exist
-        same_label = points[points["label"] == label] if label is not None else points
-        if len(same_label) == 0:
-            same_label = points
-
-        total_dist = same_label["geometry"].apply(lambda g: origin.distance(g) + destination.distance(g))
-        closest    = same_label.loc[total_dist.idxmin()]
-        return closest[["geometry", "importance", "interview_point_id", "label"]]
-
-    result = borders[["interview_place", "start_x", "start_y", "end_x", "end_y", "trip_mode"]].apply(sample_point, axis=1)
-    borders[["interview_geometry_point", "importance", "interview_point_id", "interview_point_label"]] = result
-
-    # The point has to serve the mode the agent travels with, since it becomes
-    # that agent's border activity in data.cross_border.activities: car (and
-    # its passengers) cross at a road point, public transport at a pt one. That
-    # holds by construction above, including in the fallback, so this only
-    # catches a mode that mode_to_label does not know about.
-    expected_label = borders["trip_mode"].map(mode_to_label)
-    mismatched     = expected_label.notna() & (borders["interview_point_label"] != expected_label)
-
-    assert not mismatched.any(), (
-        "%d records got a border crossing point that does not serve their mode, e.g. %s"
-        % (int(mismatched.sum()),
-           borders.loc[mismatched, ["trip_mode", "interview_point_label"]].head().to_dict("records"))
-    )
-
-    logger.info("Border crossing points by mode: %s",
-                borders.groupby(["trip_mode", "interview_point_label"]).size().to_dict())
-
-    return borders
+    # Unresolved endpoints still enter the calibration denominator and diagnostics.
+    for column in ["interview_geometry_point", "importance", "interview_point_id", "interview_point_label"]:
+        if column in borders:
+            all_borders[column] = borders[column].reindex(all_borders.index)
+    return all_borders
 
 
 def read_2015_data(context):
@@ -604,10 +939,12 @@ def read_2015_data(context):
     df2015.loc[df2015["road_type"]=="1", "road_type"] = "road"
     df2015.loc[df2015["road_type"]=="2", "road_type"] = "rail"
 
+    # Coaches (4) are dropped: the 2021 survey has none, so counting them as pt
+    # inflated the 2015/2021 pt scaling factors of the trips entering CH.
     df2015["vehicle_type"] = df2015["vehicle_type"].astype(str)
+    df2015 = df2015[df2015["vehicle_type"]!="4"].copy()
     df2015.loc[df2015["vehicle_type"]=="1", "vehicle_type"] = "car"
     df2015.loc[df2015["vehicle_type"]=="3", "vehicle_type"] = "car"
-    df2015.loc[df2015["vehicle_type"]=="4", "vehicle_type"] = "pt"
 
     df2015["trip_purpose"] = df2015["trip_purpose"].astype(str)
     df2015.loc[df2015["trip_purpose"]=="1", "trip_purpose"] = "work"
@@ -673,6 +1010,9 @@ def read_2015_data(context):
     df2015.loc[:, "group_weight"] = df2015["weight"] 
     df2015.loc[df2015["road_type"]=="road", "group_weight"] = df2015[df2015["road_type"]=="road"]["weight"] * df2015[df2015["road_type"]=="road"]["nb_passengers"]
 
+    # Rail weights already count individuals; road occupancy still expands passengers.
+    df2015 = set_person_expansion_units(df2015)
+
     del df2015["vehicle_type"]
     del df2015["train_type"]
 
@@ -687,118 +1027,15 @@ def read_2015_data(context):
     return borders2015
 
 
-def execute(context):
-    rng = np.random.RandomState(context.config("random_seed"))
-
-    borders2021 = read_2021_data(context)
-    borders2015 = read_2015_data(context)
-
-    grouped2021 = borders2021.groupby(["trip_mode", "trip_purpose", "origin_country", "destination_country"], as_index = False)["group_weight"].sum().rename(columns = {"group_weight": "group_weight_2021"})
-    grouped2015 = borders2015.groupby(["trip_mode", "trip_purpose", "origin_country", "destination_country"], as_index = False)["group_weight"].sum().rename(columns = {"group_weight": "group_weight_2015"})
-
-    grouped = grouped2021.merge(grouped2015, how = "left", on = ["trip_mode", "trip_purpose", "origin_country", "destination_country"])
-
-    grouped.loc[grouped["group_weight_2015"].isna(), "scaling_factor"]  = 1
-    grouped.loc[~grouped["group_weight_2015"].isna(), "scaling_factor"] = grouped[~grouped["group_weight_2015"].isna()]["group_weight_2015"] / grouped[~grouped["group_weight_2015"].isna()]["group_weight_2021"]
-    grouped = grouped[["trip_mode", "trip_purpose", "origin_country", "destination_country", "scaling_factor"]]
-
-    borders = borders2021.merge(
-        grouped,
-        on=["trip_mode", "trip_purpose", "origin_country", "destination_country"],
-        how="left"
-    )
-
-    borders["weight"] = (
-        borders["weight"] *
-        borders["scaling_factor"]
-    )
-
-    borders["group_weight"] = (
-        borders["group_weight"] *
-        borders["scaling_factor"]
-    )
-
-    # Selector by origin country
-    allowed_countries  = ["FR", "DE", "AT", "LI", "IT"]
-    selected_countries = context.config("cross_border_countries")
-
-    if selected_countries != "All":
-        if isinstance(selected_countries, list):
-            selected_countries = [c for c in selected_countries if c in allowed_countries]
-            if not selected_countries:
-                raise ValueError(
-                    f"No valid countries in selection. Must be within {allowed_countries}."
-                )
-            
-            borders = borders.loc[borders["origin_country"].within(selected_countries)].copy()
-
-        elif isinstance(selected_countries, str):
-            if selected_countries not in allowed_countries:
-                raise ValueError(
-                    f"Invalid country code '{selected_countries}'. Must be one of {allowed_countries}."
-                )
-            borders = borders.loc[borders["origin_country"] == selected_countries].copy()
-
-        else:
-            raise TypeError("cross_border_countries must be a list, string, or 'All'.")
-
-    # Now process the trips
-    trips = borders[borders["travel_cat"].isin(["From CH", "To CH"])]   
-    from_to_trips = process_from_to_trips(trips, context, rng)
-
-    through = borders[borders["travel_cat"]=="Through CH"]
-    through_trips = process_through_trips(through, len(from_to_trips), context, rng)
-
-    df = pd.concat([from_to_trips, through_trips])
-
-    is_projected_columns = [c for c in ["origin_is_projected", "destination_is_projected"] if c in df.columns]
-    any_projected = df[is_projected_columns].any(axis = 1)
-    logger.info(
-        f"Overall: {any_projected.mean() * 100:.1f}% of the cross-border population has an origin and/or "
-        f"destination reprojected to the closest border crossing point ({any_projected.sum()}/{len(df)})"
-    )
-
-    # Remove people who really live in the spatial file to be excluded. This
-    # has to be checked against residence_x/residence_y (the real home
-    # location, before project_point_series_close_to_border may have snapped
-    # a far-away home onto a nearby border crossing point for the "origin"/
-    # "destination" columns) - checking origin_x/origin_y instead would catch
-    # a teleported person whose real home is nowhere near the excluded area,
-    # just because the crossing point their trip got projected onto happens
-    # to sit inside it.
-    exclude_file = context.config("cross_border_exclude_shapefiles")
-
-    if not exclude_file is None:
-        if isinstance(exclude_file, (str, Path)):
-            exclude_file = [exclude_file]
-
-        if not isinstance(exclude_file, (list, tuple)):
-            raise TypeError(
-                "cross_border_exclude_shapefiles must be a path or a list of paths."
-            )
-
-        gdfs = []
-
-        for f in exclude_file:
-            suffix = Path(f).suffix.lower()
-            if suffix not in {".gpkg", ".shp"}:
-                raise TypeError(
-                    f"{f} is not a .gpkg or .shp file."
-                )
-
-            gdf = gpd.read_file(f).to_crs("EPSG:2056")
-            gdfs.append(gdf)
-
-        exclude_region = gpd.GeoDataFrame(pd.concat(gdfs, ignore_index=True), crs="EPSG:2056")
-        residences     = gpd.GeoDataFrame(df.copy(), geometry=gpd.points_from_xy(df["residence_x"], df["residence_y"]), crs="EPSG:2056")
-
-        joined           = gpd.sjoin(residences, exclude_region[["geometry"]], how = "left", predicate = "within")
-        is_within_region = joined["index_right"].notna()
-        df["exclude"]    = is_within_region.values
-
-        excluded_ids = df.loc[df["exclude"], "cross_border_person_id"].unique()
-        df = df[~df["cross_border_person_id"].isin(excluded_ids)].copy()
-
-        del df["exclude"]
-
-    return df
+def read_road_exit_names(codebook_path):
+    """Decode the official road exit codes; the codebook accompanies the CSV."""
+    if not codebook_path.exists():
+        logger.warning("Road-exit codebook is missing at %s; exit codes are retained but cannot be mapped by name.", codebook_path)
+        return {}
+    values = pd.read_excel(codebook_path, sheet_name = "Werte", header = None, usecols = [1, 2, 3])
+    values.columns = ["variable", "code", "description"]
+    exits = values[values["variable"].ffill().eq("GUAUSREISESTRASSE")].copy()
+    exits["code"] = pd.to_numeric(exits["code"], errors = "coerce")
+    exits = exits[exits["code"].notna() & exits["code"].ne(9999)]
+    names = exits["description"].astype(str).str.replace(r"^\s*\d+\s*:\s*", "", regex = True).str.strip()
+    return dict(zip(exits["code"].astype(int), names))

@@ -38,7 +38,7 @@ from shapely.ops import unary_union
 
 from .cross_border_flow_cars import (
     _find_output_file, _polygon_outline_layer,
-    load_cross_border_person_ids, load_french_resident_cross_border_person_ids,
+    load_cross_border_person_ids, load_french_resident_person_ids,
     load_swiss_resident_cross_border_person_ids,
 )
 from .cross_border_flow_pt import load_transit_schedule
@@ -70,7 +70,7 @@ MAX_LANE = 5
 PERSON_CATEGORY_LABELS = {
     "swiss_crossborder": "Swiss resident crossing the border",
     "french_resident": "French resident",
-    "other_crossborder": "Cross-border resident (other)",
+    "other_crossborder": "Cross-border commuter (foreign resident)",
     "swiss_resident": "Swiss resident (non cross-border)",
 }
 
@@ -148,7 +148,7 @@ def classify_persons(persons_path, person_ids):
     here can be read the same way as on those maps."""
     cross_border_ids = load_cross_border_person_ids(persons_path)
     swiss_crossborder_ids = load_swiss_resident_cross_border_person_ids(persons_path)
-    french_resident_ids = load_french_resident_cross_border_person_ids(persons_path)
+    french_resident_ids = load_french_resident_person_ids(persons_path)
 
     def category(person_id):
         if person_id in swiss_crossborder_ids:
@@ -173,7 +173,7 @@ def load_network_geometry(network_path):
     node_coords = {}
     link_node_ids = {}
 
-    with xopen.xopen(network_path, "r") as f:
+    with xopen.xopen(network_path, "rb") as f:
         for _, elem in ET.iterparse(f, events=["end"]):
             if elem.tag == "node":
                 node_coords[elem.attrib["id"]] = (float(elem.attrib["x"]), float(elem.attrib["y"]))
@@ -226,7 +226,7 @@ def find_stop_events(events_path, target_facilities, start_time, end_time):
     vehicle_at_facility = {}
 
     processed = 0
-    with xopen.xopen(events_path, "r") as f:
+    with xopen.xopen(events_path, "rb") as f:
         parser = ET.iterparse(f, events=["start", "end"])
         _, root = next(parser)  # <events> start tag, kept to periodically release finished events
 
@@ -277,7 +277,7 @@ def trace_agent_trips(events_path, boarding_events, alighting_events, link_endpo
     completed_trips = []
 
     processed = 0
-    with xopen.xopen(events_path, "r") as f:
+    with xopen.xopen(events_path, "rb") as f:
         parser = ET.iterparse(f, events=["start", "end"])
         _, root = next(parser)  # <events> start tag, kept to periodically release finished events
 
