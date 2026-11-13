@@ -69,15 +69,16 @@ def attach_persons(df_persons, df_households, retain_missing_households=True):
 
 def configure(context):
     context.config("data_path")
+    from data.statpop.files import configure_year
+    configure_year(context)
 
 
 def execute(context):
-    data_path = context.config("data_path")
-
     import lzma as xz
     import data.utils
+    from data.statpop.files import statpop_path, known_total
 
-    with open("%s/statpop/STATPOP_2023_HOUSEHOLD_CH_K.csv" % data_path, mode="rb") as f:
+    with open(statpop_path(context, "household"), mode="rb") as f:
         fields = {
             "HOUSEHOLDID": int
             #"Plausibel": int
@@ -88,4 +89,5 @@ def execute(context):
             #"Plausibel": "plausible"
         }
 
-        return data.utils.read_csv(context, f, fields, renames, total=3964840)
+        return data.utils.read_csv(context, f, fields, renames, total=known_total(context, "household"),
+                                   case_insensitive=True)

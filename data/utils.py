@@ -128,7 +128,8 @@ def prepare_education_locations(df_persons, df_statent, c, df_compatibility=None
     return filters_persons, filters_locations, education_types, query_sizes
 
 
-def read_csv(context, fp, fields, renames=None, sep=";", total=None, encoding="latin1", limit=None, label="Reading csv file..."):
+def read_csv(context, fp, fields, renames=None, sep=";", total=None, encoding="latin1", limit=None, label="Reading csv file...",
+             case_insensitive=False):
     if renames is None:
         renames = {}
     header = None
@@ -141,6 +142,16 @@ def read_csv(context, fp, fields, renames=None, sep=";", total=None, encoding="l
 
         if header is None:
             header = line
+            if case_insensitive:
+                # e.g. STATPOP 2015 writes householdId / personPseudoID where 2023 has HOUSEHOLDID / personPseudoId
+                upper = {name.upper(): name for name in header}
+                header = [
+                    next((field for field in fields if field.upper() == name.upper()), name)
+                    for name in header
+                ]
+                missing = [field for field in fields if field.upper() not in upper]
+                if missing:
+                    raise KeyError("Columns not found (case-insensitive): %s" % missing)
         else:
             data.append([
                 field_function(line[header.index(field_name)])
