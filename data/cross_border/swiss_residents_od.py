@@ -40,6 +40,9 @@ def configure(context):
     context.stage("data.cross_border.road_exit_points")
 
     context.config("border_offset", default = 50000)
+    # AuGQPV observations: 2021 (default) or 2015 for the retrofit (data/cross_border/survey_2015.py)
+    from data.cross_border.survey_2015 import configure_year
+    configure_year(context)
 
 
 def execute(context):
@@ -267,7 +270,13 @@ def read_2021_data(context):
     data_path = context.config("data_path")
     data_path = f"{data_path}/crossborder/AuGQPV_2021/AGQPV21_finale_Auswertungsdatenbank.csv"
 
-    df2021 = pd.read_csv(data_path, encoding="latin1", sep = ";")
+    from data.cross_border.survey_2015 import survey_year, load_2015_in_2021_format
+    if survey_year(context) == 2015:
+        # Same processing as below, on the 2015 observations (retrofit 2015-16)
+        known = context.stage("data.cross_border.interview_places")
+        df2021 = load_2015_in_2021_format(context, list(zip(known["interview_place"], known["label"])))
+    else:
+        df2021 = pd.read_csv(data_path, encoding="latin1", sep = ";")
 
     df2021 = df2021[["INTERVIEWID", "BEFRAGUNGSORTID", "BEFRAGUNGSORT", "GRENZABSCHNITT", "TAGESTYP", "VERKEHRSTRAEGER", "UEBERGANGSART", "FAHRZEUGTYP", "GRUPPENGROESSE",
                  "WOHNORTLANDISO", "WOHNORT_GISCO_ID", "STARTORTLANDISO", "STARTORT_GISCO_ID", "ZIELORTLANDISO", "ZIELORT_GISCO_ID",
