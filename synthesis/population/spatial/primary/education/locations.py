@@ -195,6 +195,11 @@ def execute(context):
     rules = pd.read_csv(context.config("education_site_eligibility"), dtype={"statent_local_id":str})
     compatibility = pooled_compatibility(registry, rules)
     distance_model = context.stage("synthesis.population.spatial.primary.education.secondary_distances") if statpop else None
+    if distance_model is not None and not distance_model["cells"]:
+        # e.g. 2015 survey without DISTTOSCHOOL_AIR: keep donor (microcensus) distances
+        # instead of NaN targets, which would send everyone to the nearest school.
+        print("No structural survey school distances available, using donor distances")
+        distance_model = None
     locations = assign_locations(persons, context.stage("data.statent.statent"), c,
         context.config("random_seed"), compatibility, distance_model)
     if statpop:

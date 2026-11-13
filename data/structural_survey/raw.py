@@ -1,8 +1,20 @@
 import pandas as pd
 
 
+import numpy as np
+
+# Row counts, only used for the progress bar
+KNOWN_TOTALS = {2015: 269510, 2021: 286016, 2022: 282750, 2023: 317222}
+
+# Columns that do not exist in every survey year (e.g. no crowfly distances in 2015).
+# They are filled with NaN when absent; downstream code falls back accordingly.
+OPTIONAL_FIELDS = {"DISTTOWORK_AIR", "DISTTOSCHOOL_AIR"}
+
+
 def configure(context):
     context.config("data_path")
+    # Survey years to combine, read from data_path/structural_survey/se_zpers_<year>_ch.csv
+    context.config("structural_survey_years", [2021, 2022, 2023])
 
 # Structural survey interviews all (e.g., unemployed or those going to school are also present) individuals age 15 and over
 # The weights of all interviewed individuals sumup to the STATPOP values of the same year for those individuals
@@ -17,11 +29,14 @@ def execute(context):
 
     data_frames = []
 
+    years = [int(year) for year in context.config("structural_survey_years")]
+
     for path, weight_column, total, sep in [
-        ("%s/structural_survey/se_zpers_2021_ch.csv" % data_path, "WEIGHT2021", 286016, ";"),
-        ("%s/structural_survey/se_zpers_2022_ch.csv" % data_path, "WEIGHT2022", 282750, ";"),
-        ("%s/structural_survey/se_zpers_2023_ch.csv" % data_path, "WEIGHT2023", 317222, ";"),
+        ("%s/structural_survey/se_zpers_%d_ch.csv" % (data_path, year), "WEIGHT%d" % year, KNOWN_TOTALS.get(year), ";")
+        for year in years
     ]:
+        with open(path, mode="rb") as f:
+            header = f.readline().decode("latin1").strip().split(sep)
         with open(path, mode="rb") as f:
             fields = {
                 "RES_MUN": int,
@@ -111,6 +126,17 @@ def execute(context):
                 "HIGHESTCOMPLEDU": "highest_completed_education", #1: None, ... 11: Bachelor, 12: Master, 13: Doctorate       
                 "CURROCCUPATIONISCO": "isco_code"            
             }            
-            data_frames.append(data.utils.read_csv(context, f, fields, renames, total=total, sep=sep))
+            missing = [field for field in fields if field not in header]
+            unexpected = [field for field in missing if field not in OPTIONAL_FIELDS]
+            if unexpected:
+                raise KeyError("Structural survey %s lacks required columns: %s" % (path, unexpected))
+            for field in missing:
+                print("Structural survey %s: column %s absent, filled with NaN" % (path, field))
+                del fields[field]
+
+            df_year = data.utils.read_csv(context, f, fields, renames, total=total, sep=sep)
+            for field in missing:
+                df_year[renames.get(field, field)] = np.nan
+            data_frames.append(df_year)
 
     return pd.concat(data_frames, sort=True)

@@ -141,6 +141,7 @@ def execute(context):
         -8: "unknown",
         1: "walk",    # walking
         2: "walk",    # skateboard
+        3: "bike",    # bike incl. e-bike (older surveys, e.g. 2015; later split into 11/12)
         4: "car",     # Mofa / Moped / light motor bike
         5: "car",     # Car as driver or passenger
         6: "car",     # company bus
