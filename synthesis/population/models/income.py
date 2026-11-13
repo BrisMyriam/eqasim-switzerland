@@ -18,7 +18,10 @@ def draw_multinomial_from_proba(proba_matrix, classes, seed=None):
 
 def configure(context):
     context.config("random_seed")
-    context.stage("data.microcensus.21.persons")
+    # MZ 2021 by default, MZ 2015 for the retrofit (data/microcensus/year.py)
+    from data.microcensus.year import configure_year, stage_name
+    configure_year(context)
+    context.stage(stage_name(context, "persons"))
     context.stage("synthesis.population.models.employment")
     context.stage("data.constants")
 
@@ -40,7 +43,8 @@ def _execute_model(context):
     # -------------------------------------------------------------------
     # 0. LOAD DATA
     # -------------------------------------------------------------------
-    survey_df = context.stage("data.microcensus.21.persons")
+    from data.microcensus.year import stage_name
+    survey_df = context.stage(stage_name(context, "persons"))
     pop_df = context.stage("synthesis.population.models.employment")
     survey_df = survey_df[survey_df["income_imputed"]== False] #keep only those that do not have imputed income
     c = context.stage("data.constants")

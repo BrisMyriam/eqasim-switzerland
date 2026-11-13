@@ -59,9 +59,12 @@ def _to_dl_has(series):
 
 def configure(context):
     context.config("random_seed")
-    # Survey:
-    context.stage("data.microcensus.21.persons")
-    context.stage("data.microcensus.21.household_persons")
+    # Survey (MZ 2021 by default, MZ 2015 for the retrofit, see data/microcensus/year.py):
+    from data.microcensus.year import configure_year, stage_name
+    configure_year(context)
+    context.config("data_path")
+    context.stage(stage_name(context, "persons"))
+    context.stage(stage_name(context, "household_persons"))
 
     # Population:
     context.stage("synthesis.population.models.carownership")
@@ -87,11 +90,12 @@ def _execute_model(context):
     # -------------------------------------------------------------------
     # 0. LOAD DATA
     # -------------------------------------------------------------------
-    persons_df = context.stage("data.microcensus.21.persons").copy()
+    from data.microcensus.year import stage_name, household_persons_with_license
+    persons_df = context.stage(stage_name(context, "persons")).copy()
     var_raw = pd.to_numeric(persons_df["car_availability"], errors="coerce")
     persons_df["car_availability"] = np.where(var_raw == 2, 0, 1).astype("int64")
 
-    hh_persons_df = context.stage("data.microcensus.21.household_persons")[0].copy()
+    hh_persons_df = household_persons_with_license(context)
     pop_df = context.stage("synthesis.population.models.carownership").copy()
 
     # -------------------------------------------------------------------

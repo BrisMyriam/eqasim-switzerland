@@ -24,7 +24,10 @@ def configure(context):
     
     context.stage("data.microcensus.commute")
     context.stage("data.microcensus.persons")
-    context.stage("data.microcensus.21.persons")
+    # Declared but not read in execute; kept for MZ 2021 only (data/microcensus/year.py)
+    from data.microcensus.year import configure_year
+    if configure_year(context) == 2021:
+        context.stage("data.microcensus.21.persons")
 
     if context.config("include_cross_border", False):
         context.stage("data.cross_border.destinations")

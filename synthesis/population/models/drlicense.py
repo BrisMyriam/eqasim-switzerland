@@ -29,7 +29,10 @@ def _weighted_mean(x, w):
 def configure(context):
     context.config("random_seed")
     context.stage("data.constants")
-    context.stage("data.microcensus.21.persons")
+    # MZ 2021 by default, MZ 2015 for the retrofit (data/microcensus/year.py)
+    from data.microcensus.year import configure_year, stage_name
+    configure_year(context)
+    context.stage(stage_name(context, "persons"))
     configure_swiss(context)
 
 def execute(context):
@@ -51,7 +54,8 @@ def _execute_model(context):
     # -------------------------------------------------------------------
     # 0. LOAD DATA
     # -------------------------------------------------------------------
-    survey_df = context.stage("data.microcensus.21.persons")
+    from data.microcensus.year import stage_name
+    survey_df = context.stage(stage_name(context, "persons"))
     pop_df    = assigned_swiss(context)
 
     for df in (survey_df, pop_df):

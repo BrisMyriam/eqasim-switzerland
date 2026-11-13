@@ -25,8 +25,11 @@ def configure(context):
     context.stage("data.statent.statent")
     context.stage("synthesis.freight.trips")
 
-    context.stage("data.microcensus.21.trips")
-    context.stage("data.microcensus.21.persons")
+    # MZ 2021 truck trips are only added with microcensus_year 2021 (data/microcensus/year.py)
+    from data.microcensus.year import configure_year
+    if configure_year(context) == 2021:
+        context.stage("data.microcensus.21.trips")
+        context.stage("data.microcensus.21.persons")
 
     context.stage("data.statpop.persons")
     context.config("lcv_home_destination_after", default=8 * 3600)
@@ -552,48 +555,17 @@ def execute(context):
         "HHNR", "f51100", "mode", "WP"
     ]]
 
-    # --- Microcensus 2021 ---
-    df_mz21_trips = pd.read_csv("%s/microcensus/21/wege.csv" % data_path, sep=";", encoding="latin1")
-    df_mz21_persons = pd.read_csv("%s/microcensus/21/zielpersonen.csv" % data_path, sep=";", encoding="latin1")
-    df_mz21_trips = df_mz21_trips.drop(columns=["WP"])
-    df_mz21_trips = df_mz21_trips.merge(
-        df_mz21_persons[["HHNR", "WP"]],
-        on="HHNR",
-        how="left",
-    )
-   
-    df_mz21_trips["mz_year"] = 2021
-    #TODO: wmittel1 is the mode in mz 21
-    mode_map = {
-        -99: "unknown",  # Pseudo stage
-        1: "pt",         # Plane
-        2: "pt",         # Train
-        3: "pt",         # Ship
-        4: "pt",         # Tram
-        5: "pt",         # Bus, postauto
-        6: "pt",         # other PT
-        7: "pt",         # Reisecar (coach)
-        8: "car",        # Car
-        9: "truck",       # Truck
-        10: "pt",        # Taxi
-        11: "pt",        # Taxi-like modes e.g. Uber
-        12: "car",       # Motorbike
-        13: "car",       # Mofa
-        14: "bike",      # E-bike
-        15: "bike",      # bike
-        16: "walk",      # Walking
-        17: "bike",      # Machines similar to a vehicle
-        18: "unknown"    # Other / don't know
-    }
+    # --- Microcensus 2021 (skipped with microcensus_year 2015: MZ 2015 truck trips only) ---
+    from data.microcensus.year import microcensus_year
+    frames = [df_mz15_trips]
+    if microcensus_year(context) == 2021:
+        frames.append(read_mz21_truck_trips(data_path))
+    logger.info("    LCV departure times from %d MZ truck trips (%s).", sum(len(f) for f in frames),
+                "MZ 2015 + 2021" if len(frames) == 2 else "MZ 2015 only")
 
-    df_mz21_trips["mode"] = df_mz21_trips["wmittel1"].map(mode_map)
-    df_mz21_trips = df_mz21_trips[df_mz21_trips["mode"]=="truck"]
-    df_mz21_trips = df_mz21_trips[[
-        "HHNR", "f51100", "mode", "WP"
-    ]]
     # --- Combine both years ---
     df_mz_trips = pd.concat(
-        [df_mz15_trips, df_mz21_trips],
+        frames,
         ignore_index=True,
         sort=False,
     )
@@ -665,3 +637,45 @@ def execute(context):
     departure_distribution["share"] = departure_distribution["n_trips"] / departure_distribution["n_trips"].sum()
 
     return trips_df
+
+
+def read_mz21_truck_trips(data_path):
+    df_mz21_trips = pd.read_csv("%s/microcensus/21/wege.csv" % data_path, sep=";", encoding="latin1")
+    df_mz21_persons = pd.read_csv("%s/microcensus/21/zielpersonen.csv" % data_path, sep=";", encoding="latin1")
+    df_mz21_trips = df_mz21_trips.drop(columns=["WP"])
+    df_mz21_trips = df_mz21_trips.merge(
+        df_mz21_persons[["HHNR", "WP"]],
+        on="HHNR",
+        how="left",
+    )
+   
+    df_mz21_trips["mz_year"] = 2021
+    #TODO: wmittel1 is the mode in mz 21
+    mode_map = {
+        -99: "unknown",  # Pseudo stage
+        1: "pt",         # Plane
+        2: "pt",         # Train
+        3: "pt",         # Ship
+        4: "pt",         # Tram
+        5: "pt",         # Bus, postauto
+        6: "pt",         # other PT
+        7: "pt",         # Reisecar (coach)
+        8: "car",        # Car
+        9: "truck",       # Truck
+        10: "pt",        # Taxi
+        11: "pt",        # Taxi-like modes e.g. Uber
+        12: "car",       # Motorbike
+        13: "car",       # Mofa
+        14: "bike",      # E-bike
+        15: "bike",      # bike
+        16: "walk",      # Walking
+        17: "bike",      # Machines similar to a vehicle
+        18: "unknown"    # Other / don't know
+    }
+
+    df_mz21_trips["mode"] = df_mz21_trips["wmittel1"].map(mode_map)
+    df_mz21_trips = df_mz21_trips[df_mz21_trips["mode"]=="truck"]
+    df_mz21_trips = df_mz21_trips[[
+        "HHNR", "f51100", "mode", "WP"
+    ]]
+    return df_mz21_trips

@@ -33,8 +33,12 @@ def _weighted_mean(x, w):
 
 def configure(context):
     context.config("random_seed")
-    context.stage("data.microcensus.21.persons")
-    context.stage("data.microcensus.21.household_persons")
+    # MZ 2021 by default, MZ 2015 for the retrofit (data/microcensus/year.py)
+    from data.microcensus.year import configure_year, stage_name
+    configure_year(context)
+    context.config("data_path")
+    context.stage(stage_name(context, "persons"))
+    context.stage(stage_name(context, "household_persons"))
     context.stage("synthesis.population.models.drlicense")
 
 def execute(context):
@@ -59,8 +63,9 @@ def _execute_model(context):
     # -------------------------------------------------------------------
     #TODO: add household type to the variables
     # we need to create the types as reported in mz in hhtyp variable
-    survey_df = context.stage("data.microcensus.21.persons").copy()
-    survey_hh_df = context.stage("data.microcensus.21.household_persons")[0]
+    from data.microcensus.year import stage_name, household_persons_with_license
+    survey_df = context.stage(stage_name(context, "persons")).copy()
+    survey_hh_df = household_persons_with_license(context)
 
     # --- ensure types (do this BEFORE using age) ---
     survey_hh_df["age"] = pd.to_numeric(survey_hh_df["age"], errors="coerce")
