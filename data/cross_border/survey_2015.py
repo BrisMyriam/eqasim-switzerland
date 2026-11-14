@@ -7,7 +7,7 @@ The 2015 survey stays the volume reference, so the calibration becomes an identi
 
 Differences of the 2015 file, handled here:
 - one weight GEWICHT (vehicles for road, persons for rail, as already assumed by
-  read_2015_data), copied to GEWICHT_Personen and GEWICHT_Fahrzeuge;
+  read_2015_data), split into GEWICHT_Fahrzeuge / GEWICHT_Personen as in 2021;
 - no GISCO ids: built from the BFS number (CH_CH0261) or the NUTS code (DE_DE132),
   which survey_locations.recover_locations understands;
 - ZUGTYP FV / RV instead of 1 / 2; FAHRZEUGTYP 3 = motorcycle (2 in 2021),
@@ -95,8 +95,16 @@ def load_2015_in_2021_format(context, known_places):
     df["FAHRZEUGTYP"] = df["FAHRZEUGTYP"].astype(str).str.strip().replace({"3": "2"})
     df["ZUGTYP"] = df["ZUGTYP"].astype(str).str.strip().replace({"FV": "1", "RV": "2"})
 
-    df["GEWICHT_Personen"] = df["GEWICHT"]
-    df["GEWICHT_Fahrzeuge"] = df["GEWICHT"]
+    # Same definitions as the 2021 file: road GEWICHT is a vehicle weight (uncorrelated
+    # with occupancy), so persons = vehicles x group size, as in 2021 where
+    # GEWICHT_Personen == GEWICHT_Fahrzeuge * GRUPPENGROESSE; rail GEWICHT counts
+    # persons and rail has no vehicle weight. read_2021_data only uses
+    # GEWICHT_Fahrzeuge on road and GEWICHT_Personen on rail.
+    weight = pd.to_numeric(df["GEWICHT"], errors="coerce")
+    road = pd.to_numeric(df["VERKEHRSTRAEGER"], errors="coerce").eq(1)
+    group = pd.to_numeric(df["GRUPPENGROESSE"], errors="coerce")
+    df["GEWICHT_Fahrzeuge"] = weight.where(road)
+    df["GEWICHT_Personen"] = weight.where(~road, weight * group)
 
     for prefix, nuts, bfs in [("WOHNORT", "WOHNORTORTGEONAMESID_NUTS", "WOHNORTORTGEONAMESID_BFSNUMMER"),
                               ("STARTORT", "STARTORTORTGEONAMESID_NUTS", "STARTORTORTGEONAMESID_BFSNUMMER"),
