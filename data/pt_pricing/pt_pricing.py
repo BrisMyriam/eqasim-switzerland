@@ -40,6 +40,9 @@ def configure(context):
     context.config("pt_zones_foreign_communes_file", default = "pt_pricing/communes_france.gpkg")
     context.config("pt_zones_foreign_zones_file", default = "pt_pricing/unireso_france_zones.csv")
 
+    # The fare description, relative to data_path (another file for another year, e.g. the 2015-16 retrofit)
+    context.config("pt_pricing_description_file", default = "pt_pricing/output/pricingDescription.xml")
+
     context.stage("data.gtfs.cleaned")
 
     if pt_pricing_option:
@@ -53,15 +56,17 @@ def execute(context):
 
     data_path         = context.config("data_path")
     pt_pricing_option = context.config("generate_pt_pricing_inputs")
+    # always copied as pricingDescription.xml, the name eqasim-java is given
+    pricing_input_file = os.path.join(data_path, context.config("pt_pricing_description_file"))
+    shutil.copy(pricing_input_file, f"{context.path()}/pricingDescription.xml")
+    logger.info(f"Fare description: {pricing_input_file}")
 
     if not pt_pricing_option:
         sbb_input_file     = f"{data_path}/pt_pricing/output/SBB_all_distances.csv"
         zones_input_file   = f"{data_path}/pt_pricing/output/gtfs_zones.csv"
-        pricing_input_file = f"{data_path}/pt_pricing/output/pricingDescription.xml"
 
         shutil.copy(sbb_input_file, context.path())
         shutil.copy(zones_input_file, context.path())
-        shutil.copy(pricing_input_file, context.path())
 
         logger.info("Files copied")
 
@@ -69,10 +74,7 @@ def execute(context):
         sbb_distances = context.stage("data.pt_pricing.t603.create_sbb_distances")
         authorities   = context.stage("data.pt_pricing.t651.process_all_authorities")
 
-        # TODO create the stages that create the pricing description xml file
-        pricing_input_file = f"{data_path}/pt_pricing/output/pricingDescription.xml"
-        shutil.copy(pricing_input_file, context.path())
-
+        # TODO create the stages that create the pricing description xml file (copied above)
         sbb_distances.to_csv(f"{context.path()}/SBB_all_distances.csv", index=False)
         authorities.to_csv(f"{context.path()}/gtfs_zones.csv", index=False)
 
